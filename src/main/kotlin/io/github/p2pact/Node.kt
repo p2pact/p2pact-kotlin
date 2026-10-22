@@ -109,6 +109,9 @@ private class PeerState(val addr: String) {
     var dicts: List<ByteArray> = emptyList() // its dictionaries (ids), by slot — from its hello and 0.5
     var lacks = ArrayList<ByteArray>() // it asked us for these, so it lacks them until it announces again
     val waiting = ArrayDeque<Inbound>() // waiting for a dictionary (spec §5): run in order once it arrives
+    var waitSince = 0L // when the head of waiting started to wait (unhold)
+    var askingInfo = false // our 0.2 info call is on its way (askInfo)
+    var askedInfo = 0L
     var fetching = false
     var tried = ArrayList<ByteArray>() // dictionaries of its list we asked it for and did not get
     val sysCalls = HashSet<Long>() // our calls of tool 0: their results are not conversation
@@ -164,6 +167,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     @Volatile var onPaired: ((Peer) -> Unit)? = null
     /** onHello is called when a known device sends its hello. */
     @Volatile var onHello: ((String) -> Unit)? = null
+    /** onHeld is called when messages from a device waited too long for a dictionary or its list and were dropped. */
+    @Volatile var onHeld: ((peer: String, held: Int) -> Unit)? = null
     /** allowDict decides whether a known device may fetch a dictionary (0.5); null — all may. */
     @Volatile var allowDict: ((peer: String, id: ByteArray) -> Boolean)? = null
     /** noCompression turns compression off for what we send (benchmarks, debugging). */
@@ -1069,6 +1074,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             if (s == null && now - ps.lastInit >= AUTO_CONNECT) startInit(now, p.addr, ps, null)
             if (s != null) probe(now, p.addr, ps, s)
         }
+        unhold(now)
         sessions.entries.removeIf { (_, s) -> current[s.peer] !== s && now - s.lastRecv > SESSION_IDLE }
         hs.entries.removeIf { now - it.value.at > 60 * SEC }
         val wall = System.currentTimeMillis()
@@ -1133,8 +1139,48 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 return
             }
         }
+        if (ps.waiting.isEmpty()) ps.waitSince = Clock.nanos()
         ps.waiting.addLast(Inbound(msg, zip, stream))
         drain(peer, ps)
+    }
+
+    /**
+     * unhold: held messages do not wait forever (spec §5) — after HOLD_ASK we ask again (the hello,
+     * the dictionary); after HOLD_DROP they are dropped (the sender resends what matters) and the
+     * lists are learnt anew.
+     */
+    private fun unhold(now: Long) {
+        for ((peer, ps) in peers) {
+            if (ps.waiting.isEmpty()) continue
+            val held = now - ps.waitSince
+            when {
+                held >= holdDrop -> {
+                    val k = ps.waiting.size
+                    ps.waiting.clear()
+                    ps.fetching = false; ps.askingInfo = false
+                    ps.dicts = emptyList(); ps.lacks = ArrayList(); ps.tried = ArrayList()
+                    sendInfo(peer)
+                    onHeld?.let { cb -> io.execute { cb(peer, k) } }
+                }
+                held >= holdAsk -> if (ps.dicts.isEmpty()) askInfo(peer, ps) else { ps.tried = ArrayList(); drain(peer, ps) }
+            }
+        }
+    }
+
+    /** askInfo asks the device for its hello (0.2 info) when we hold its messages without its list. */
+    private fun askInfo(peer: String, ps: PeerState) {
+        val now = Clock.nanos()
+        if (ps.askingInfo || now - ps.askedInfo < 10 * SEC) return
+        ps.askingInfo = true; ps.askedInfo = now
+        call(peer, 0, 2, timeoutMs = 30_000).whenComplete { res, err ->
+            post {
+                ps.askingInfo = false
+                if (err != null || res == null || res.size < 5 || ps.dicts.isNotEmpty() || peers[peer] !== ps) return@post
+                ps.dicts = idsOf(res[4])
+                fetchNew(peer, ps)
+                drain(peer, ps)
+            }
+        }
     }
 
     /** drain runs waiting messages in order until one cannot be decoded yet. */
@@ -1150,7 +1196,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                     }
                     ps.waiting.removeFirst() // a free slot: the message is damaged
                 }
-                Unzip.NoList -> return // wait for a hello or 0.5
+                Unzip.NoList -> { askInfo(peer, ps); return } // wait for a hello or 0.5, and ask for it
                 Unzip.Bad -> ps.waiting.removeFirst()
                 is Unzip.Plain -> {
                     ps.waiting.removeFirst()
@@ -1295,6 +1341,10 @@ private fun idsOf(v: Any?): List<ByteArray> = v.asList()?.mapNotNull { it as? By
  * bootstrap: a hello or a dictionary list ([3, 0, 2|5, …]) carries what the receiver needs to
  * decompress, so it always goes uncompressed — a device that restarted must be able to read it.
  */
+/** Held messages (spec §5): ask again after holdAsk, drop after holdDrop; tests shorten them. */
+@Volatile internal var holdAsk = 15 * SEC
+@Volatile internal var holdDrop = 120 * SEC
+
 internal fun bootstrap(m: ByteArray): Boolean =
     m.size > 3 && m[1].toInt() == 3 && m[2].toInt() == 0 && (m[3].toInt() == 2 || m[3].toInt() == 5)
 

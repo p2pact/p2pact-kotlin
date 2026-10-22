@@ -3,6 +3,7 @@ package io.github.p2pact
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -167,6 +168,15 @@ class NodeTest {
             assertEquals(st.own!!.hex(), st.using?.hex())
         }
         for (m in CompressTest.chat(1000, 20)) echo(a, b, m, 2)
+    }
+
+    /** The hello and the dictionary list are never compressed (spec §5); conversation may be. */
+    @Test
+    fun bootstrapMessagesStayPlain() {
+        assertTrue(bootstrap(Cbor.encode(listOf(3, 0, 2, "Phone"))))
+        assertTrue(bootstrap(Cbor.encode(listOf(3, 0, 5, emptyList<Any>()))))
+        assertFalse(bootstrap(Cbor.encode(listOf(3, 64, 1, "line"))))
+        assertFalse(bootstrap(Cbor.encode(listOf(1, 7, "result"))))
     }
 
     @Test
