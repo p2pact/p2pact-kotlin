@@ -58,6 +58,9 @@ class RelayRoad internal constructor(val hint: RelayHint, private val recv: Rece
         for (k in channels.keys.toList()) leave(k)
     }
 
+    /** open counts joined channels (tests). */
+    internal val open: Int get() = channels.size
+
     private fun keep(c: Chan) {
         var backoff = 500L
         while (!c.stopped) {

@@ -24,7 +24,7 @@ import kotlin.random.Random
  * bytes a second (a write waits for the link, as a GATT write waits for its acknowledgement), a
  * one-way delay; it keeps order and loses nothing, as GATT does while connected.
  */
-private class FakeBle(val mtu: Int, val rate: Int, val delayMs: Long) : AppRoad {
+internal class FakeBle(val mtu: Int, val rate: Int, val delayMs: Long) : AppRoad {
     /** instead of the delay: a local TCP connection (a pipe to another program) and its other end */
     var conn: Socket? = null
     var peer: Socket? = null
@@ -83,8 +83,8 @@ private class FakeBle(val mtu: Int, val rate: Int, val delayMs: Long) : AppRoad 
     }
 }
 
-private const val BLE_MTU = 20 // the smallest GATT write
-private const val BLE_RATE = 40 shl 10 // a Bluetooth LE link under load
+internal const val BLE_MTU = 20 // the smallest GATT write
+internal const val BLE_RATE = 40 shl 10 // a Bluetooth LE link under load
 
 class AppRoadTest {
     @get:Rule

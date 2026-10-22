@@ -16,8 +16,10 @@ private const val TS_SKEW = 120 * SEC // an older handshake start is a replay: d
 private const val INIT_EVERY = SEC // handshake retry while unanswered
 private const val AUTO_CONNECT = 30 * SEC // how often to try known devices without a session
 private const val ALIVE_FOR = 60 * SEC // a road is alive if something arrived on it within this time
-private const val KEEPALIVE_GAP = 25 * SEC
 private const val SESSION_IDLE = 180 * SEC
+
+/** keepaliveGap: how long a live road may stay quiet before a keepalive goes on it; tests shorten it. */
+@Volatile internal var keepaliveGap = 25 * SEC
 
 /** probeEvery: how often the direct roads are tried while a session runs over a relay or an application road (spec §7); tests shorten it. */
 @Volatile internal var probeEvery = 30 * SEC
@@ -196,6 +198,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val dicts = DictStore(dir, io)
     private val learner = Learner(dir, dicts, timing, io, trainer, ::post) { d -> addDictLocal(d) }
     private var woken = false
+    private var paused = false // the device sleeps (setPaused): nothing is sent, nothing is taken in
     @Volatile private var closed = false
     private var lastTs = 0L
     private val handshakeCount = AtomicInteger()
@@ -315,6 +318,52 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     }
 
     /**
+     * setPaused pauses the node (true) or resumes it: for a computer going to sleep, so that
+     * nothing the node does on the network wakes it. While paused the node sends nothing at all and
+     * takes in nothing: relay connections close, TCP connections close and new ones are refused
+     * (the listener stays, so the port and the hints do not change), the UDP socket stays open but
+     * silent, roads the application attached stay attached but get nothing to send. No keepalives,
+     * no probes, no reconnects. What the application sends meanwhile is queued and calls keep their
+     * timeouts. Other devices see a device that is unreachable.
+     *
+     * On resume the node speaks first: it rejoins its relay channels, sends a keepalive to every
+     * device it has a session with (on all its roads) and starts a handshake with every other
+     * known device, then sends what was queued. Calling it twice with the same value does nothing;
+     * after [close] it does nothing.
+     */
+    fun setPaused(on: Boolean) {
+        if (closed) return
+        try {
+            onLoop { if (!closed) pause(on) }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            // closed meanwhile
+        }
+    }
+
+    /** relayChannels counts the relay channels open (tests). */
+    internal val relayChannels: Int get() = onLoop { relays.values.sumOf { it.open } }
+
+    private fun pause(on: Boolean) {
+        if (paused == on) return
+        paused = on
+        tcp?.pause(on)
+        if (on) {
+            for (r in relays.values) r.close()
+            for (a in apps) a.drop()
+            return
+        }
+        val now = Clock.nanos()
+        ownRelay?.let { h -> for (k in invites.keys) relay(h).join(k, "a") }
+        for (p in trust.list()) {
+            joinPair(p)
+            peerState(p.addr)?.lastInit = 0 // the handshakes below go now, not after AUTO_CONNECT
+        }
+        for ((peer, ps) in peers) current[peer]?.let { sendData(now, peer, ps, it, keepalive(), true) }
+        pump(now)
+        maintain(now)
+    }
+
+    /**
      * handle registers method tool.method. Calls of one device on one stream run one at a time,
      * in the order sent, together with its events there (spec §6); other streams do not wait. A
      * handler that waits long returns [later], so that the stream goes on without it.
@@ -327,7 +376,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     fun invite(ttlMs: Long): Invite = onLoop {
         val inv = Invite(id.key.public, name, randomBytes(32), System.currentTimeMillis() + ttlMs, hints())
         invites[inv.id.hex()] = inv
-        ownRelay?.let { relay(it).join(inv.id.hex(), "a") }
+        if (!paused) ownRelay?.let { relay(it).join(inv.id.hex(), "a") } // paused: joined on resume
         inv
     }
 
@@ -340,7 +389,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             tcp?.let { t -> inv.hints.tcp.forEach { eps.add(Endpoint(t, it)) } }
             var r: RelayRoad? = null
             inv.hints.relay?.let {
-                r = relay(it).also { rr -> rr.join(inv.id.hex(), "b") }
+                r = relay(it)
                 eps.add(Endpoint(r!!, inv.id.hex()))
             }
             // a link the application opened to a device it has not named
@@ -364,7 +413,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 local = newIndex()
                 hs[local] = PendingHs(true, h, Clock.nanos(), invite = inv, done = done)
                 val pkt = cat(byteArrayOf(P_PAIR1.toByte()), inv.id, be32(local), msg1)
-                for (e in eps) e.road.send(e.addr, pkt)
+                if (!paused) { // paused: try again on the next round
+                    r?.join(inv.id.hex(), "b") // again after a pause closed it
+                    for (e in eps) e.road.send(e.addr, pkt)
+                }
                 loop.schedule({ post { attempt() } }, INIT_EVERY / MS, TimeUnit.MILLISECONDS)
             }
             done.whenComplete { _, _ -> post { hs.remove(local); r?.leave(inv.id.hex()) } }
@@ -471,7 +523,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     // --- receiving ---
 
     private fun receive(pkt: ByteArray, from: Endpoint) {
-        if (pkt.size < 5 || closed) return
+        // paused: what came is dropped unanswered, its sender sends it again after we resume
+        if (pkt.size < 5 || closed || paused) return
         val now = Clock.nanos()
         try {
             when (pkt[0].toInt()) {
@@ -845,6 +898,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 
     /** sealTo sends packet content on one endpoint only (a keepalive, a probe). */
     private fun sealTo(s: Session, e: EpState, now: Long, plain: ByteArray) {
+        if (paused) return
         if (e.ep.road.send(e.ep.addr, seal(s, plain))) e.lastSend = now
     }
 
@@ -892,6 +946,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      * when there is a session (so the other side binds it too), a handshake when not.
      */
     private fun appAttached(now: Long, a: AttachedRoad) {
+        if (paused) return // it is offered on resume, with the other roads
         val peer = a.peer ?: return
         val ps = peerState(peer) ?: return
         val e = ps.eps.getOrPut(a.endpoint.key) { EpState(a.endpoint) }
@@ -921,6 +976,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private fun relay(h: RelayHint): RelayRoad = relays.getOrPut(h.addr) { RelayRoad(h, ::receiveFromRoad) }
 
     private fun sendData(now: Long, peer: String, ps: PeerState, s: Session, plain: ByteArray, all: Boolean) {
+        if (paused) return
         val pkt = seal(s, plain)
         for (e in candidates(peer, ps, now, all)) if (e.ep.road.send(e.ep.addr, pkt)) e.lastSend = now
     }
@@ -935,7 +991,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     /** startInit starts a session with a known device (Noise_IK); first is first-packet data. */
     private fun startInit(now: Long, peer: String, ps: PeerState, first: ByteArray?) {
         val p = trust.get(peer) ?: return
-        if (now - ps.lastInit < ps.initGap()) return
+        if (paused || now - ps.lastInit < ps.initGap()) return
         ps.lastInit = now
         // keep the last few unanswered starts: a reply to any of them opens the session
         val pending = hs.entries.filter { !it.value.pair && it.value.peer == peer }.sortedBy { it.value.at }.map { it.key }.toMutableList()
@@ -960,6 +1016,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 
     /** pump sends what is queued and what is due for retransmission. */
     private fun pump(now: Long) {
+        if (paused) return // nothing goes, and no timer counts a try: delivery resumes where it stopped
         for ((peer, ps) in peers) {
             val s = current[peer]
             if (s == null) {
@@ -991,7 +1048,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 sendData(now, peer, ps, s, next.plain, next.retry)
             }
             for (e in ps.eps.values) { // keepalive on every quiet road
-                if (now - e.lastRecv <= ALIVE_FOR && now - e.lastSend >= KEEPALIVE_GAP) {
+                if (now - e.lastRecv <= ALIVE_FOR && now - e.lastSend >= keepaliveGap) {
                     if (e.ep.road.send(e.ep.addr, seal(s, keepalive()))) e.lastSend = now
                 }
             }
@@ -1000,9 +1057,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 
     /** maintain runs every second: connect to known devices, keep relay channels, clean up. */
     private fun maintain(now: Long) {
+        if (paused) return
         for (p in trust.list()) {
             val ps = peerState(p.addr) ?: continue
-            pairRelay(p)?.join(p.relayChannel, if (p.addr < id.addr) "b" else "a")
+            joinPair(p)
             val s = current[p.addr]
             if (s == null && now - ps.lastInit >= AUTO_CONNECT) startInit(now, p.addr, ps, null)
             if (s != null) probe(now, p.addr, ps, s)
@@ -1016,6 +1074,11 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 ownRelay?.let { relay(it).leave(k) }
             }
         }
+    }
+
+    /** joinPair keeps the pair's relay channel open. */
+    private fun joinPair(p: Peer) {
+        pairRelay(p)?.join(p.relayChannel, if (p.addr < id.addr) "b" else "a")
     }
 
     private fun newIndex(): Long {

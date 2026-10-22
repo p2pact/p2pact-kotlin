@@ -56,6 +56,10 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
 - A handler that waits long (an agent's turn, a person's answer) returns `later(future)`: its
   stream goes on at once, and the call's result goes when the future completes.
 - `setRelay(RelayHint(addr, fingerprint))` — our relay, for pairing and for the pair's channel.
+- `setPaused(true)` before the computer sleeps, `setPaused(false)` when it wakes: while paused
+  the node sends nothing (relay and TCP connections closed, no keepalives), so it does not wake
+  the computer; messages wait in their queues, calls keep their timeouts. On resume it speaks to
+  its devices first and sessions come back at once.
 - `dictState(peer)` tells which dictionary compresses what we send; `noLearning` turns
   training off, `noCompression` compression.
 - `befriend` adds a device known from the family book, without pairing; `forget` drops one.

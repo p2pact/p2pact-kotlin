@@ -144,6 +144,9 @@ class AttachedRoad internal constructor(
         }
     }
 
+    /** drop discards what waits for the application's send (the node pauses): delivery sends it again after resume. */
+    internal fun drop() = out.clear()
+
     /** detach stops using the road: the link is gone. The session goes on over the other roads. */
     fun detach() {
         if (!stopped.compareAndSet(false, true)) return

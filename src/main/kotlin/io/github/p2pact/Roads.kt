@@ -147,6 +147,7 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
     private val server: ServerSocket?
     private val conns = ConcurrentHashMap<String, Conn>() // by remote address as we know it
     private val closed = AtomicBoolean()
+    @Volatile private var paused = false // no connections (the node pauses); the listener stays and refuses them
     private val sentBytes = AtomicLong()
     private val sentPackets = AtomicLong()
     private val recvBytes = AtomicLong()
@@ -220,6 +221,10 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
             Thread({
                 while (!closed.get()) {
                     val s = try { ss.accept() } catch (e: IOException) { break }
+                    if (paused) {
+                        try { s.close() } catch (e: IOException) { }
+                        continue
+                    }
                     val addr = joinHostPort(s.inetAddress, s.port)
                     val c = Conn(addr)
                     conns.put(addr, c)?.stop()
@@ -239,7 +244,7 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
 
     /** send queues a packet to addr, dialing in the background if there is no connection. */
     override fun send(addr: String, pkt: ByteArray): Boolean {
-        if (pkt.size > MAX_PACKET + 64 || closed.get()) return false
+        if (pkt.size > MAX_PACKET + 64 || closed.get() || paused) return false
         var c = conns[addr]
         if (c == null || c.isStopped) {
             val nc = Conn(addr)
@@ -269,6 +274,15 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
             c.serve(s)
         }, "p2pact-tcp-dial").apply { isDaemon = true }.start()
     }
+
+    /** pause closes every connection and refuses new ones (true), or takes them again. */
+    internal fun pause(on: Boolean) {
+        paused = on
+        if (on) for (c in conns.values) c.stop()
+    }
+
+    /** connections counts open connections (tests). */
+    internal val connections: Int get() = conns.size
 
     internal fun close() {
         closed.set(true)
