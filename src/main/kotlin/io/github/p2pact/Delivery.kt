@@ -40,10 +40,12 @@ internal class Part(
     val more: Boolean,
     val zip: Boolean,
     val stream: Long, // 0 — the ordered default stream
+    val reply: Boolean = false, // part of a result or error: it answers a call of this boot only
 ) {
     var num = 0L // message number in its stream (from 1), on the first part
     var first = false // first part of a message on a stream
-    var firstSent = 0L
+    var copies = ArrayList<Long>(1) // when each copy was sent
+    var timer = false // the last copy went because the timer ran out
     var sent = 0L
     var tries = 0
     var delivered = 0L // bytes delivered when this part was sent: its ack gives a rate sample
@@ -183,16 +185,23 @@ internal class Delivery {
 
     /**
      * reset handles a restart of the other device (spec §4.2): our unacknowledged parts are
-     * renumbered from 1; receiving restarts from 1 too.
+     * renumbered from 1; receiving restarts from 1 too. Replies are dropped: the calls they
+     * answer ended with the restart, and the new call ids start from 1 again, so a stale reply
+     * would answer a new call.
      */
     fun reset() {
         val pending = inflight.values.sortedBy { it.seq }.toMutableList()
         pending.addAll(queue)
         next = 1; inflight = HashMap(); queue = ArrayDeque(); inflightBytes = 0
         resetRecv()
+        // the path may be another one now: measure it afresh (a stale minimum round trip would
+        // read every round trip as a queue, or every ack of a retransmission as a real one)
+        cwnd = CWND_START; ssthresh = CWND_MAX; lastCut = 0
+        srtt = 0; rttvar = 0; minRTT = 0; bw = 0.0; bwAt = 0
         for (p in pending) {
+            if (p.reply) continue
             p.seq = next++
-            p.firstSent = 0; p.sent = 0; p.tries = 0
+            p.copies = ArrayList(1); p.sent = 0; p.tries = 0; p.timer = false
             if (p.first) { // the other side expects each stream from message 1 again
                 val n = (snext[p.stream] ?: 0) + 1
                 snext[p.stream] = n
@@ -202,8 +211,11 @@ internal class Delivery {
         }
     }
 
-    /** push queues a message in parts on a stream (0 — the ordered default); zip marks it compressed. */
-    fun push(msg: ByteArray, zip: Boolean, stream: Long) {
+    /**
+     * push queues a message in parts on a stream (0 — the ordered default); zip marks it
+     * compressed, reply — a result or error (dropped if the other device restarts).
+     */
+    fun push(msg: ByteArray, zip: Boolean, stream: Long, reply: Boolean = false) {
         var num = 0L
         if (stream != 0L) {
             num = (snext[stream] ?: 0) + 1
@@ -213,7 +225,7 @@ internal class Delivery {
         var first = true
         while (true) {
             val n = minOf(msg.size - at, MAX_PART)
-            val p = Part(next++, msg.copyOfRange(at, at + n), at + n < msg.size, zip, stream)
+            val p = Part(next++, msg.copyOfRange(at, at + n), at + n < msg.size, zip, stream, reply)
             if (stream != 0L && first) {
                 p.first = true
                 p.num = num
@@ -241,6 +253,7 @@ internal class Delivery {
         var retry = false
         if (p != null) {
             retry = true
+            p.timer = p.sent != 0L // not taken as lost by an ack: the timer ran out
             lost(now)
         } else if (queue.isNotEmpty() && canSend()) {
             p = queue.removeFirst()
@@ -272,7 +285,7 @@ internal class Delivery {
                 flags = flags or F_CONT
             }
             b.bytes(p.data)
-            if (p.firstSent == 0L) p.firstSent = now
+            p.copies.add(now)
             p.delivered = delivered
             p.sent = now
             p.tries++
@@ -325,9 +338,18 @@ internal class Delivery {
             var newest = 0L // the latest send time among the parts this ack covers
             fun ack(seq: Long) {
                 val p = inflight[seq] ?: return
-                // an ack sooner than a round trip after a retransmission is for an earlier copy:
-                // its send time says nothing (RFC 8985 §6.2)
-                if (p.sent > newest && (p.tries == 1 || now - p.sent >= maxOf(minRTT, srtt / 2))) newest = p.sent
+                // an ack sooner than the minimum round trip after a timer's copy is for an earlier
+                // copy: the timer fired on a queue, not a loss (RFC 8985 §6.2). The newest copy's
+                // time would declare every part sent between the copies lost, and their copies
+                // would fire the same way, again and again. The ack is not ambiguous, so it is a
+                // round-trip sample (Karn's rule skips it otherwise): without one the timer
+                // would stay shorter than the queue for good.
+                var sent = p.sent
+                if (p.timer && now - p.sent < minRTT) {
+                    for ((i, c) in p.copies.withIndex()) if (i == 0 || now - c >= minRTT) sent = c
+                    sample(now - sent)
+                }
+                if (sent > newest) newest = sent
                 delivered += p.data.size
                 if (p.tries == 1) {
                     sample(now - p.sent)

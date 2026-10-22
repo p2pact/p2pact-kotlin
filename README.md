@@ -49,7 +49,10 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
   `Long`, `ByteArray`, `String`, `List`, `Map`, `Boolean`, `Double`, `null`); an error answer
   completes it with `P2pactError(code, text)`. With kotlinx-coroutines, `.await()` it.
 - `handle` registers a method; handlers run on a worker pool and may block.
-- `event` / `eventOn` send events; `onEvent` receives them in order on one callback thread.
+- `event` / `eventOn` send events; `onEvent` receives them on the worker pool.
+- Calls and events of one device on one stream run one at a time, in the order sent; other
+  streams do not wait for them (a slow handler holds up its own stream only). Service calls
+  (tool 0) run at once.
 - `setRelay(RelayHint(addr, fingerprint))` — our relay, for pairing and for the pair's channel.
 - `dictState(peer)` tells which dictionary compresses what we send; `noLearning` turns
   training off, `noCompression` compression.

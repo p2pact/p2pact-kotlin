@@ -103,4 +103,63 @@ class DeliveryTest {
         assertEquals(false, d.receive(SEC, ByteArray(0)) { _, _, _ -> })
         assertEquals(false, d.receive(SEC, byteArrayOf(F_ACK.toByte(), 0x80.toByte())) { _, _, _ -> })
     }
+
+    /**
+     * The other device restarted: our unacknowledged calls go again, renumbered; replies to its
+     * old calls are dropped (they would answer its new calls with the same ids), and the path is
+     * measured afresh.
+     */
+    @Test
+    fun resetDropsReplies() {
+        val a = Delivery()
+        a.push("call".toByteArray(), false, 1)
+        a.push("reply".toByteArray(), false, 2, reply = true)
+        a.push("queued reply".toByteArray(), false, 2, reply = true)
+        a.nextPacket(SEC, false)
+        a.nextPacket(SEC, false)
+        a.srtt = 80 * MS; a.minRTT = 60 * MS; a.bw = 1e6; a.cwnd = 100.0
+        a.reset()
+        assertEquals(1, a.queue.size)
+        assertEquals("call", String(a.queue[0].data))
+        assertEquals(1L, a.queue[0].seq)
+        assertEquals(1L, a.queue[0].num)
+        assertEquals(2L, a.next)
+        assertEquals(0L, a.srtt)
+        assertEquals(0L, a.minRTT)
+        assertEquals(0.0, a.bw, 0.0)
+        assertEquals(CWND_START, a.cwnd, 0.0)
+    }
+
+    /**
+     * A timeout fired by a queue, not a loss: the ack of the first copy comes just after the
+     * retransmission. It must not mark the parts sent between the copies lost, and it is a
+     * round-trip sample, so the timer catches up with the queue (spec §5).
+     */
+    @Test
+    fun ackOfAnEarlierCopyAfterATimeout() {
+        val a = Delivery()
+        val b = Delivery()
+        val t0 = SEC
+        fun exchange(at: Long, vararg pkts: ByteArray) {
+            for (p in pkts) b.receive(at, p) { _, _, _ -> }
+            val ack = b.nextPacket(at, true)!!.plain
+            a.receive(at + MS, ack) { _, _, _ -> }
+        }
+        a.push("first".toByteArray(), false, 1) // a round-trip sample: 60 ms
+        exchange(t0 + 59 * MS, a.nextPacket(t0, false)!!.plain)
+        assertEquals(60 * MS, a.minRTT)
+        val sent = t0 + 100 * MS
+        val pkts = ArrayList<ByteArray>()
+        for (i in 0 until 5) {
+            a.push("queued".toByteArray(), false, 1)
+            pkts.add(a.nextPacket(sent, false)!!.plain)
+        }
+        val at = sent + a.timeout(a.inflight[2]!!, 0)
+        assertTrue("no retransmission on timeout", a.nextPacket(at, false)!!.retry)
+        val srtt = a.srtt
+        exchange(at + MS, pkts[0]) // the first copy, late behind a queue
+        assertEquals(null, a.inflight[2L])
+        for ((seq, p) in a.inflight) assertTrue("part $seq taken as lost", p.sent != 0L)
+        assertTrue("no round-trip sample from the ack", a.srtt > srtt)
+    }
 }

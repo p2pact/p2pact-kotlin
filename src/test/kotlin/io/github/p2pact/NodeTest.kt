@@ -199,4 +199,113 @@ class NodeTest {
         assertEquals(31, seen.size) // each call ran exactly once
         assertEquals(seen.toSet().size, seen.size)
     }
+
+    /**
+     * Events and calls of one stream run in the order sent, one at a time; a slow handler holds
+     * up its own stream only (spec §6).
+     */
+    @Test
+    fun streamOrderOfEventsAndCalls() {
+        val a = node("a")
+        val b = node("b")
+        pair(a, b)
+        val release = java.util.concurrent.CountDownLatch(1)
+        b.handle(64, 2) { _, _ -> release.await(); emptyList() } // slow, on stream 2
+        val total = 300
+        val got = java.util.Collections.synchronizedList(ArrayList<Int>())
+        val done = java.util.concurrent.CountDownLatch(1)
+        val rnd = Random(3)
+        b.onEvent = { _, _, ev, _ ->
+            Thread.sleep(0, synchronized(rnd) { rnd.nextInt(200_000) }) // a thread per event would reorder
+            got.add(ev)
+            if (got.size == total) done.countDown()
+        }
+        val slow = a.callOn(b.id.addr, 2, 64, 2, timeoutMs = 20_000)
+        Thread.sleep(100)
+        a.eventOn(b.id.addr, 2, 64, 0) // behind the slow call
+        for (i in 1 until total) a.eventOn(b.id.addr, 1, 64, i)
+        // a service call is not held up by the slow handler either
+        a.call(b.id.addr, 0, 1, timeoutMs = 5000).get()
+        assertEquals("an event overtook the slow call on its stream", false, done.await(3, TimeUnit.SECONDS))
+        assertEquals("the slow call held up another stream", total - 1, got.size)
+        release.countDown()
+        slow.get(10, TimeUnit.SECONDS)
+        assertTrue("the events did not arrive", done.await(10, TimeUnit.SECONDS))
+        assertEquals(0, got[total - 1])
+        assertEquals((1 until total).toList(), got.subList(0, total - 1).toList())
+    }
+
+    /**
+     * The other device restarts silently while our calls are in flight: we handshake again with
+     * a part in the first packet, numbered for its old boot; its reply renumbers everything
+     * (spec §4.2). Every call must still run exactly once, and later calls must not be lost.
+     */
+    @Test
+    fun restartWithPartsInFlight() {
+        val a = node("a")
+        val dirB = tmp.newFolder()
+        val b = node("b", dir = dirB)
+        pair(a, b)
+        for (i in 0 until 10) echo(a, b, "before".toByteArray()) // the numbering moves on
+        val port = b.udpRoad!!.localAddr
+        b.udpRoad!!.drop = { true } // the calls below never reach the old boot
+        val runs = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        fun call(s: String) = a.call(b.id.addr, 64, 3, s, timeoutMs = 10_000)
+        val lost = listOf("lost 1", "lost 2", "lost 3").map { it to call(it) }
+        Thread.sleep(300)
+        b.close()
+        nodes.remove(b)
+        val b2 = Node(dirB, "b")
+        b2.handle(64, 3) { _, args -> runs.merge(args[0] as String, 1, Int::plus); listOf(args[0]) }
+        b2.listenUdp(port)
+        nodes.add(b2)
+        // we notice first (the new boot answers handshakes before start): the session is gone
+        // and the lost calls are due, so the first one rides in the handshake's first packet
+        a.dropSession(b.id.addr)
+        Thread.sleep(300)
+        b2.start()
+        for ((s, f) in lost) assertEquals(s, f.get()[0])
+        for (i in 0 until 20) assertEquals("after $i", call("after $i").get()[0])
+        for ((s, n) in runs) assertEquals("\"$s\" ran $n times", 1, n)
+        assertEquals(23, runs.size)
+    }
+
+    /**
+     * The caller restarts while its call runs: the result is not sent, and it must not answer
+     * the restarted caller's new call with the same id (spec §4.2).
+     */
+    @Test
+    fun noStaleResultAfterTheCallerRestarts() {
+        val dirA = tmp.newFolder()
+        val a = node("a", dir = dirA)
+        val b = node("b")
+        pair(a, b)
+        val started = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        b.handle(64, 3) { _, args ->
+            if (args[0] == "old") {
+                started.countDown()
+                release.await()
+            }
+            listOf(args[0])
+        }
+        a.call(b.id.addr, 64, 3, "old")
+        assertTrue(started.await(10, TimeUnit.SECONDS))
+        val port = a.udpRoad!!.localAddr
+        a.close()
+        nodes.remove(a)
+        val a2 = Node(dirA, "a")
+        a2.listenUdp(port)
+        a2.start()
+        nodes.add(a2)
+        val hs = b.handshakes
+        val fresh = a2.call(b.id.addr, 64, 3, "new", timeoutMs = 10_000) // the same call id as "old"
+        for (i in 0 until 250) {
+            if (b.handshakes > hs) break
+            Thread.sleep(20)
+        }
+        Thread.sleep(200)
+        release.countDown()
+        assertEquals("new", fresh.get()[0])
+    }
 }

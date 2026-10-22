@@ -77,6 +77,7 @@ private class PeerState(val addr: String) {
     val eps = HashMap<String, EpState>()
     var lastTS = 0L // timestamp of the last accepted handshake start
     var boot = 0L // the other device's boot id (from the handshake)
+    var heard = false // it knows our boot id: sent us session data or answered our handshake
     var lastInit = 0L
     val calls = HashMap<Long, CompletableFuture<List<Any?>>>()
     var callID = 0L
@@ -86,9 +87,16 @@ private class PeerState(val addr: String) {
     var fetching = false
     var tried = ArrayList<ByteArray>() // dictionaries of its list we asked it for and did not get
     val sysCalls = HashSet<Long>() // our calls of tool 0: their results are not conversation
+    val inbox = HashMap<Long, Inbox>() // calls and events waiting for their turn, per stream
 
     /** initGap: retry a handshake after three measured round trips (250 ms – 2 s), else 1 s. */
     fun initGap(): Long = if (st.srtt == 0L) INIT_EVERY else (3 * st.srtt).coerceIn(250 * MS, 2 * SEC)
+}
+
+/** Inbox runs a stream's calls and events one at a time, in the order they came (spec §6). */
+private class Inbox {
+    val q = ArrayDeque<() -> Unit>()
+    var running = false
 }
 
 private fun daemon(name: String) = ThreadFactory { r -> Thread(r, name).apply { isDaemon = true } }
@@ -111,16 +119,21 @@ internal fun goos(): String {
 /**
  * Node is a device in a P2PACT network (spec §1–§8): pairing, sessions over any road, delivery,
  * messages and compression. All protocol state lives on one thread (the node's loop); roads
- * receive on their own threads and hand packets to it. Handlers run on a worker pool, events
- * and callbacks on one callback thread (in order), training and history writes on their own
- * threads: the sending path never waits for them.
+ * receive on their own threads and hand packets to it. Calls and events run on a worker pool:
+ * those of one device on one stream one at a time, in the order sent, other streams in
+ * parallel (spec §6); service calls (tool 0) at once. Other callbacks run on one callback
+ * thread, training and history writes on their own threads: the sending path never waits for
+ * them.
  */
 class Node(dir: File, val name: String, private val timing: LearnTiming = LearnTiming()) {
     private val dir = dir.also { it.mkdirs() }
     val id: Identity = Identity.load(dir)
     val trust = Trust(dir)
 
-    /** onEvent receives tool events (except tool 0) from known devices, in order, on the callback thread. */
+    /**
+     * onEvent receives tool events (except tool 0) from known devices: in the order sent on each
+     * stream, one at a time, together with that stream's calls (spec §6), on a worker thread.
+     */
     @Volatile var onEvent: ((peer: String, tool: Int, event: Int, args: List<Any?>) -> Unit)? = null
     /** onPaired is called after pairing (on either side). */
     @Volatile var onPaired: ((Peer) -> Unit)? = null
@@ -276,7 +289,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         trust.flush()
     }
 
-    /** handle registers method tool.method. */
+    /**
+     * handle registers method tool.method. Calls of one device on one stream run one at a time,
+     * in the order sent, together with its events there (spec §6); other streams do not wait.
+     */
     fun handle(tool: Int, method: Int, h: Handler) = onLoop { handlers[tool to method] = h }
 
     // --- pairing ---
@@ -477,6 +493,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         s.lastRecv = now
         if (current[s.peer] == null) current[s.peer] = s
         val ps = peerState(s.peer) ?: return
+        ps.heard = true
         seen(ps, from, now, s.local)
         ps.st.receive(now, plain) { m, z, st -> inbound(s.peer, m, z, st) }
         if (ps.st.ackDue != 0L && now >= ps.st.ackDue) wake() // an ack is due now
@@ -504,7 +521,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 8))
         from.road.send(from.addr, cat(byteArrayOf(P_RESP.toByte()), be32(s.remote), be32(local), resp))
-        if (payload.size > 12) { // data in the first packet
+        // data in the first packet; from a device that has not heard our boot id it may be
+        // numbered for our previous boot, to be renumbered once it gets our reply: drop it
+        // unacknowledged, it comes again in the session (spec §4.2)
+        if (payload.size > 12 && ps.heard) {
             ps.st.receive(now, payload.copyOfRange(12, payload.size)) { m, z, st -> inbound(peer, m, z, st) }
         }
         sendInfo(peer)
@@ -524,6 +544,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         current[h.peer] = s
         handshakeCount.incrementAndGet()
         val ps = peerState(h.peer) ?: return
+        ps.heard = true
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 0))
         sendInfo(h.peer)
@@ -638,7 +659,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 if (tool != 0) hear(peer, msg)
                 val h = handlers[tool to method]
                 val args = a.subList(4, a.size)
-                workers.execute {
+                val boot = ps.boot
+                val run = {
                     val out: List<Any?> = if (h == null) {
                         listOf(2, cid, Errors.NO_METHOD, "no such method")
                     } else try {
@@ -649,8 +671,14 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                         listOf(2, cid, Errors.FAILED, e.message ?: e.toString())
                     }
                     val b = Cbor.encode(out)
-                    post { peerState(peer)?.let { push(it, b, stream, tool != 0) } } // the result goes back on the call's stream
+                    post {
+                        // the result goes back on the call's stream, unless the caller restarted meanwhile
+                        val p = peerState(peer)
+                        if (p != null && (boot == 0L || p.boot == boot)) push(p, b, stream, tool != 0, reply = true)
+                    }
                 }
+                // service calls (a dictionary, a ping) never wait behind a slow handler
+                if (tool == 0) execute(run) else enqueue(ps, stream, run)
             }
             1L, 2L -> { // result, error
                 val cid = a[1].asLong() ?: return
@@ -688,7 +716,43 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 if (tool != 0) hear(peer, msg)
                 val cb = onEvent ?: return
                 val args = a.subList(3, a.size)
-                callbacks.execute { cb(peer, tool, ev, args) }
+                enqueue(ps, stream) { cb(peer, tool, ev, args) }
+            }
+        }
+    }
+
+    private fun execute(f: () -> Unit) {
+        try {
+            workers.execute(f)
+        } catch (e: java.util.concurrent.RejectedExecutionException) { // closed
+        }
+    }
+
+    /**
+     * enqueue runs f behind the stream's earlier calls and events. Each stream has its own turn
+     * on the worker pool while it has work: a slow handler holds up its stream only.
+     */
+    private fun enqueue(ps: PeerState, stream: Long, f: () -> Unit) {
+        val ib = ps.inbox.getOrPut(stream) { Inbox() }
+        ib.q.addLast(f)
+        if (ib.running) return
+        ib.running = true
+        runNext(ps, stream, ib)
+    }
+
+    private fun runNext(ps: PeerState, stream: Long, ib: Inbox) {
+        val f = ib.q.removeFirstOrNull()
+        if (f == null || closed) {
+            ib.running = false
+            if (ps.inbox[stream] === ib) ps.inbox.remove(stream)
+            return
+        }
+        execute {
+            try {
+                f()
+            } catch (e: Exception) { // a failing callback does not stop its stream
+            } finally {
+                post { runNext(ps, stream, ib) }
             }
         }
     }
@@ -789,13 +853,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         for ((peer, ps) in peers) {
             val s = current[peer]
             if (s == null) {
-                // take a part for the first packet only when a handshake really goes out. Only
-                // in our first session with the device since we started: on a later one it may
-                // have restarted, and a part numbered before our reply's boot id renumbers
-                // everything (§4.2) would stay with it under its old number — a duplicate of
-                // the message it carries, and the part that gets that number later lost.
+                // take a part for the first packet only when a handshake really goes out (a
+                // restarted device drops it unacknowledged until it has heard us: spec §4.2)
                 if (!ps.st.idle() && now - ps.lastInit >= ps.initGap() && trust.get(peer) != null) {
-                    startInit(now, peer, ps, if (ps.boot == 0L) ps.st.nextPacket(now, false)?.plain else null)
+                    startInit(now, peer, ps, ps.st.nextPacket(now, false)?.plain)
                 }
                 continue
             }
@@ -856,14 +917,14 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      * through event 0.5, which travels in the same order as messages. talk: the message is
      * conversation (not tool 0), so it goes to the history.
      */
-    private fun push(ps: PeerState, msg: ByteArray, stream: Long, talk: Boolean) {
+    private fun push(ps: PeerState, msg: ByteArray, stream: Long, talk: Boolean, reply: Boolean = false) {
         if (noCompression) {
-            ps.st.push(msg, false, stream)
+            ps.st.push(msg, false, stream, reply)
         } else {
             val (d, slot) = dicts.pick(ps.addr, ps.dicts, ps.lacks)
             val z = compress(msg, d, slot)
             if (talk && !noLearning) learner.talk(ps.addr, msg, d, z)
-            if (z != null) ps.st.push(z, true, stream) else ps.st.push(msg, false, stream)
+            if (z != null) ps.st.push(z, true, stream, reply) else ps.st.push(msg, false, stream, reply)
         }
         wake()
     }
@@ -1035,6 +1096,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     internal fun historySize(peer: String): Pair<Int, Int> = onLoop { learner.historySize(peer) }
 
     internal fun learnTick() = onLoop { learner.tick() }
+
+    /** dropSession forgets the session with peer and makes what is in flight due at once (tests). */
+    internal fun dropSession(peer: String) = onLoop {
+        current.remove(peer)
+        peers[peer]?.st?.inflight?.values?.forEach { it.sent = 0 }
+        wake()
+    }
 }
 
 private fun idsOf(v: Any?): List<ByteArray> = v.asList()?.mapNotNull { it as? ByteArray } ?: emptyList()
