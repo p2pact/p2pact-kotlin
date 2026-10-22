@@ -789,9 +789,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         for ((peer, ps) in peers) {
             val s = current[peer]
             if (s == null) {
-                // take a part for the first packet only when a handshake really goes out
+                // take a part for the first packet only when a handshake really goes out. Only
+                // in our first session with the device since we started: on a later one it may
+                // have restarted, and a part numbered before our reply's boot id renumbers
+                // everything (§4.2) would stay with it under its old number — a duplicate of
+                // the message it carries, and the part that gets that number later lost.
                 if (!ps.st.idle() && now - ps.lastInit >= ps.initGap() && trust.get(peer) != null) {
-                    startInit(now, peer, ps, ps.st.nextPacket(now, false)?.plain)
+                    startInit(now, peer, ps, if (ps.boot == 0L) ps.st.nextPacket(now, false)?.plain else null)
                 }
                 continue
             }

@@ -168,4 +168,35 @@ class NodeTest {
         }
         for (m in CompressTest.chat(1000, 20)) echo(a, b, m, 2)
     }
+
+    @Test
+    fun receiverRestartsWithoutTheDictionary() {
+        val a = node("a")
+        val dirB = tmp.newFolder()
+        val b = node("b", dir = dirB)
+        a.addDict(CommonDict.raw)
+        b.addDict(CommonDict.raw)
+        pair(a, b)
+        for (i in 0 until 15) echo(a, b, "warm up $i".toByteArray())
+        val common = dictId(CommonDict.raw).hex()
+        assertEquals(common, a.dictState(b.id.addr).using?.hex())
+        val port = b.udpRoad!!.localAddr
+        b.close()
+        nodes.remove(b)
+        java.io.File(dirB, "net-dicts").deleteRecursively()
+        // compressed with a dictionary the restarted device no longer has, sent before it is back
+        val text = "the agent finished the task and pushed a commit; the tests pass and the build is green.".toByteArray()
+        val pending = a.call(b.id.addr, 64, 1, text, timeoutMs = 30_000)
+        Thread.sleep(300)
+        val seen = java.util.Collections.synchronizedList(ArrayList<String>())
+        val b2 = Node(dirB, "b")
+        b2.listenUdp(port)
+        b2.handle(64, 1) { _, args -> seen.add(String(args[0] as ByteArray)); listOf(args[0]) }
+        b2.start()
+        nodes.add(b2)
+        assertArrayEquals(text, pending.get()[0] as ByteArray) // held, the dictionary fetched, then run
+        for (i in 0 until 30) echo(a, b2, "after $i: the agent finished the task and pushed a commit; the tests pass.".toByteArray())
+        assertEquals(31, seen.size) // each call ran exactly once
+        assertEquals(seen.toSet().size, seen.size)
+    }
 }
