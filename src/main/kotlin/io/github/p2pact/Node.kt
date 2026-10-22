@@ -192,6 +192,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val relays = HashMap<String, RelayRoad>() // by server address
     private val apps = LinkedHashSet<AttachedRoad>() // roads the application provides
     private var advertise: Hints? = null
+    private var hintsSent: ByteArray? = null // our addresses as last announced (reannounce)
+    private var hintsAt = 0L
 
     private val sessions = HashMap<Long, Session>() // by our index
     private val current = HashMap<String, Session>() // the best session with a device
@@ -734,6 +736,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     /** sendInfo sends our hello: name, where to find us and our dictionaries (event 0.2). */
     private fun sendInfo(peer: String) {
         val ps = peerState(peer) ?: return
+        hintsSent = Cbor.encode(hints().toWire()) // what the devices know of us (reannounce)
         push(ps, Cbor.encode(listOf<Any?>(3, 0, 2) + info(peer)), 0, false)
     }
 
@@ -1075,6 +1078,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             if (s != null) probe(now, p.addr, ps, s)
         }
         unhold(now)
+        reannounce(now)
         sessions.entries.removeIf { (_, s) -> current[s.peer] !== s && now - s.lastRecv > SESSION_IDLE }
         hs.entries.removeIf { now - it.value.at > 60 * SEC }
         val wall = System.currentTimeMillis()
@@ -1165,6 +1169,19 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 held >= holdAsk -> if (ps.dicts.isEmpty()) askInfo(peer, ps) else { ps.tried = ArrayList(); drain(peer, ps) }
             }
         }
+    }
+
+    /**
+     * reannounce: our addresses changed (another network, an advertised address) — tell the devices
+     * in session at once with our hello, not at the next handshake (as p2pact-go).
+     */
+    private fun reannounce(now: Long) {
+        if (now - hintsAt < 5 * SEC) return
+        hintsAt = now
+        val sent = hintsSent ?: return
+        val cur = Cbor.encode(hints().toWire())
+        if (cur.contentEquals(sent)) return
+        for (peer in current.keys.toList()) sendInfo(peer)
     }
 
     /** askInfo asks the device for its hello (0.2 info) when we hold its messages without its list. */
