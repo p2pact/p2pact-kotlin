@@ -2,6 +2,7 @@
 // stdout. Every implementation ships one, so any two can be tested against each other.
 //
 //   {"cmd":"listen","udp":"127.0.0.1:0","tcp":"127.0.0.1:0"}  → {"addr":"…","udp":"…","tcp":"…"}
+//     optional "relay":"host:port","fp":"<hex>" — our relay (pairing and pair channels)
 //   {"cmd":"invite"}                                          → {"invite":"p2pact1.…"}
 //   {"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //   {"cmd":"known","peer":"…"}                                → {"known":true|false}
@@ -17,6 +18,7 @@ import io.github.p2pact.Invite
 import io.github.p2pact.Json
 import io.github.p2pact.Node
 import io.github.p2pact.P2pactError
+import io.github.p2pact.RelayHint
 import java.io.File
 import java.nio.file.Files
 import java.util.Base64
@@ -50,6 +52,7 @@ fun main(argv: Array<String>) {
                 "listen" -> {
                     (req["udp"] as? String)?.let { if (it.isNotEmpty()) node.listenUdp(it) }
                     (req["tcp"] as? String)?.let { node.listenTcp(it) }
+                    (req["relay"] as? String)?.let { node.setRelay(RelayHint(it, req["fp"] as? String ?: "")) }
                     say(mapOf("addr" to node.id.addr, "udp" to (node.udpRoad?.localAddr ?: ""), "tcp" to (node.tcpRoad?.localAddr ?: "")))
                 }
                 "invite" -> say(mapOf("invite" to node.invite(600_000).toString()))
