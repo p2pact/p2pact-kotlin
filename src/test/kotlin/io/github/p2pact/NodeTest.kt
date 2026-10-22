@@ -236,6 +236,37 @@ class NodeTest {
     }
 
     /**
+     * A handler that answers later lets its stream go on: an event and a call sent behind it run
+     * (in the order sent) while it waits, and its result comes when ready (spec §6).
+     */
+    @Test
+    fun answerLater() {
+        val a = node("a")
+        val b = node("b")
+        pair(a, b)
+        val turn = java.util.concurrent.CompletableFuture<List<Any?>>()
+        val started = java.util.Collections.synchronizedList(ArrayList<String>())
+        b.handle(64, 2) { _, _ -> started.add("long"); later(turn) } // an agent's turn
+        b.handle(64, 3) { _, _ -> started.add("call"); listOf("quick") }
+        b.handle(64, 4) { _, _ -> later(java.util.concurrent.CompletableFuture.failedFuture(P2pactError(4, "no"))) }
+        b.onEvent = { _, _, _, _ -> started.add("event") }
+        val long = a.callOn(b.id.addr, 2, 64, 2, timeoutMs = 20_000)
+        Thread.sleep(100)
+        a.eventOn(b.id.addr, 2, 64, 1) // a cancel, say
+        assertEquals(listOf("quick"), a.callOn(b.id.addr, 2, 64, 3, timeoutMs = 3000).get(5, TimeUnit.SECONDS))
+        assertEquals(listOf("long", "event", "call"), started.toList())
+        assertEquals("the long call was answered before it was done", false, long.isDone)
+        turn.complete(listOf("done"))
+        assertEquals(listOf("done"), long.get(5, TimeUnit.SECONDS))
+        try {
+            a.callOn(b.id.addr, 2, 64, 4, timeoutMs = 3000).get(5, TimeUnit.SECONDS)
+            fail("no error")
+        } catch (e: ExecutionException) {
+            assertEquals(4, (e.cause as P2pactError).code)
+        }
+    }
+
+    /**
      * The other device restarts silently while our calls are in flight: we handshake again with
      * a part in the first packet, numbered for its old boot; its reply renumbers everything
      * (spec §4.2). Every call must still run exactly once, and later calls must not be lost.

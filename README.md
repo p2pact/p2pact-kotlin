@@ -53,6 +53,8 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
 - Calls and events of one device on one stream run one at a time, in the order sent; other
   streams do not wait for them (a slow handler holds up its own stream only). Service calls
   (tool 0) run at once.
+- A handler that waits long (an agent's turn, a person's answer) returns `later(future)`: its
+  stream goes on at once, and the call's result goes when the future completes.
 - `setRelay(RelayHint(addr, fingerprint))` — our relay, for pairing and for the pair's channel.
 - `dictState(peer)` tells which dictionary compresses what we send; `noLearning` turns
   training off, `noCompression` compression.

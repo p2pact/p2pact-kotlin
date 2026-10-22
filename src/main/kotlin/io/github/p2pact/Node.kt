@@ -2,6 +2,7 @@ package io.github.p2pact
 
 import java.io.File
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionStage
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
@@ -34,10 +35,28 @@ object Errors {
 /** P2pactError is a call error (spec §6): a code and a text. */
 class P2pactError(val code: Int, text: String) : Exception(text)
 
-/** Handler is a tool method: decoded CBOR arguments → result values (or a thrown P2pactError). */
+/**
+ * Handler is a tool method: decoded CBOR arguments → result values (or a thrown P2pactError). A
+ * handler that would wait long returns [later] instead, so its stream goes on (spec §6).
+ */
 fun interface Handler {
     fun handle(peer: String, args: List<Any?>): List<Any?>
 }
+
+/** Later is a reply taken out of the stream's turn: see [later]. It holds no result values. */
+class Later internal constructor(val reply: CompletionStage<List<Any?>>) : AbstractList<Any?>() {
+    override val size get() = 0
+    override fun get(index: Int): Any? = throw IndexOutOfBoundsException("a reply given later")
+}
+
+/**
+ * later answers a call later (spec §6): a handler returns later(reply), its turn on the stream
+ * ends there, so the stream's next calls and events run (a cancel among them), and the call's
+ * result or error goes when reply completes — unless the caller restarted meanwhile.
+ *
+ *     node.handle(1, 1) { peer, args -> later(CompletableFuture.supplyAsync { runTurn(args) }) }
+ */
+fun later(reply: CompletionStage<List<Any?>>): List<Any?> = Later(reply)
 
 /** DictState tells what compresses messages to a device (see [Node.dictState]). */
 data class DictState(val own: ByteArray?, val using: ByteArray?, val training: Boolean)
@@ -297,7 +316,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 
     /**
      * handle registers method tool.method. Calls of one device on one stream run one at a time,
-     * in the order sent, together with its events there (spec §6); other streams do not wait.
+     * in the order sent, together with its events there (spec §6); other streams do not wait. A
+     * handler that waits long returns [later], so that the stream goes on without it.
      */
     fun handle(tool: Int, method: Int, h: Handler) = onLoop { handlers[tool to method] = h }
 
@@ -674,21 +694,28 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 val h = handlers[tool to method]
                 val args = a.subList(4, a.size)
                 val boot = ps.boot
-                val run = {
-                    val out: List<Any?> = if (h == null) {
-                        listOf(2, cid, Errors.NO_METHOD, "no such method")
-                    } else try {
-                        listOf<Any?>(1, cid) + h.handle(peer, args)
-                    } catch (e: P2pactError) {
-                        listOf(2, cid, e.code, e.message ?: "")
-                    } catch (e: Exception) {
-                        listOf(2, cid, Errors.FAILED, e.message ?: e.toString())
+                fun reply(res: List<Any?>?, err: Throwable?) {
+                    val e = if (err is java.util.concurrent.CompletionException && err.cause != null) err.cause else err
+                    val out: List<Any?> = when (e) {
+                        null -> listOf<Any?>(1, cid) + res.orEmpty()
+                        is P2pactError -> listOf(2, cid, e.code, e.message ?: "")
+                        else -> listOf(2, cid, Errors.FAILED, e.message ?: e.toString())
                     }
                     val b = Cbor.encode(out)
                     post {
                         // the result goes back on the call's stream, unless the caller restarted meanwhile
                         val p = peerState(peer)
                         if (p != null && (boot == 0L || p.boot == boot)) push(p, b, stream, tool != 0, reply = true)
+                    }
+                }
+                val run: () -> Unit = {
+                    if (h == null) {
+                        reply(null, P2pactError(Errors.NO_METHOD, "no such method"))
+                    } else {
+                        val res = try { h.handle(peer, args) } catch (e: Exception) { reply(null, e); null }
+                        // a reply given later: the turn ends here, the reply goes when it is ready
+                        if (res is Later) res.reply.whenComplete { r, e -> reply(r, e) }
+                        else if (res != null) reply(res, null)
                     }
                 }
                 // service calls (a dictionary, a ping) never wait behind a slow handler

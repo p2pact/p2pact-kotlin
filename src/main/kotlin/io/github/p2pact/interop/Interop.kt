@@ -7,6 +7,10 @@
 //   {"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //   {"cmd":"known","peer":"…"}                                → {"known":true|false}
 //   {"cmd":"call","peer":"…","data":"<base64>","stream":N}    → {"data":"<base64>"}  (echo, tool 64 method 1)
+//   {"cmd":"later","peer":"…","data":"<base64>","stream":N}   → {"data":"<base64>"}
+//     a call answered later (spec §6): calls tool 64 method 2 on the stream, which the other side
+//     holds until a 64.1 call reaches it, then a 64.1 call on the same stream; answers with the
+//     64.2 result, or an error if the 64.1 call waited behind the held one
 //   {"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //   {"cmd":"dict-state","peer":"…"}                           → {"own":"<base64>"|null,"using":…,"training":bool}
 //   {"cmd":"road","listen":"127.0.0.1:0","mtu":20,"rate":N}   → {"road":"127.0.0.1:…"}
@@ -26,6 +30,7 @@ import io.github.p2pact.Json
 import io.github.p2pact.Node
 import io.github.p2pact.P2pactError
 import io.github.p2pact.RelayHint
+import io.github.p2pact.later
 import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -33,16 +38,33 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
 import java.util.Base64
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
 fun main(argv: Array<String>) {
     val dir = argv.getOrNull(0)?.let { File(it) } ?: Files.createTempDirectory("p2pact-interop-").toFile()
     val node = Node(dir, argv.getOrNull(1) ?: "kotlin")
+    // 64.2 echoes too, but answers later: once a 64.1 call has run after it (on its stream, that
+    // call is behind it; it passes only if the held call does not hold up the stream)
+    val held = ArrayList<CompletableFuture<List<Any?>>>()
     node.handle(64, 1) { _, args ->
         val b = args.getOrNull(0) as? ByteArray ?: if (args.getOrNull(0) == null) ByteArray(0) else
             throw P2pactError(Errors.BAD_ARGS, "no data")
+        synchronized(held) {
+            held.forEach { it.complete(null) }
+            held.clear()
+        }
         listOf(b)
+    }
+    node.handle(64, 2) { _, args ->
+        val b = args.getOrNull(0) as? ByteArray ?: throw P2pactError(Errors.BAD_ARGS, "no data")
+        val f = CompletableFuture<List<Any?>>()
+        synchronized(held) { held.add(f) }
+        later(f.orTimeout(30, TimeUnit.SECONDS)
+            .exceptionally { throw P2pactError(Errors.FAILED, "no call came behind") }
+            .thenApply { listOf(b) })
     }
     node.start()
     val out = System.out
@@ -74,6 +96,19 @@ fun main(argv: Array<String>) {
                     val stream = (req["stream"] as? Number)?.toLong() ?: 0
                     val res = node.callOn(req["peer"] as String, stream, 64, 1, data, timeoutMs = 60_000).get()
                     val b = res.getOrNull(0) as? ByteArray ?: throw IllegalStateException("invalid result")
+                    say(mapOf("data" to enc.encodeToString(b)))
+                }
+                "later" -> {
+                    val data = dec.decode(req["data"] as? String ?: "")
+                    val stream = (req["stream"] as? Number)?.toLong() ?: 0
+                    val first = node.callOn(req["peer"] as String, stream, 64, 2, data, timeoutMs = 20_000)
+                    Thread.sleep(100) // the held call goes first
+                    try {
+                        node.callOn(req["peer"] as String, stream, 64, 1, "behind".toByteArray(), timeoutMs = 10_000).get()
+                    } catch (e: ExecutionException) {
+                        throw IllegalStateException("the call behind the held one: ${e.cause?.message ?: e.cause}")
+                    }
+                    val b = first.get().getOrNull(0) as? ByteArray ?: throw IllegalStateException("invalid result")
                     say(mapOf("data" to enc.encodeToString(b)))
                 }
                 "dict" -> {
