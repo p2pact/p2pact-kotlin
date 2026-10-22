@@ -186,7 +186,7 @@ internal fun hasId(list: List<ByteArray>, id: ByteArray) = list.any { same(it, i
  * file "order", a line per dictionary: "<id hex>" for a common one, "<id hex> <device> own|their"
  * for a pair's (the same layout as p2pact-go).
  */
-internal class DictStore(dir: File) {
+internal class DictStore(dir: File, private val io: java.util.concurrent.Executor = java.util.concurrent.Executor { it.run() }) {
     val dir = File(dir, "net-dicts")
     var dicts: List<Dict> = emptyList() // newest first
         private set
@@ -217,11 +217,20 @@ internal class DictStore(dir: File) {
     /** get returns dictionary id if peer may see it. */
     fun get(id: ByteArray, peer: String): Dict? = dicts.firstOrNull { same(it.id, id) && it.visible(peer) }
 
-    /** add puts a dictionary first (moving it up if known) and deletes the oldest extra ones of its kind. */
+    /**
+     * add puts a dictionary first (moving it up if known) and deletes the oldest extra ones of its
+     * kind. The files are written on [io], in order: the node's thread never waits for the disk.
+     */
     fun add(d: Dict) {
-        dir.mkdirs()
-        val f = File(dir, d.id.hex())
-        if (!f.exists() || f.length() != d.raw.size.toLong()) writeAtomic(f, d.raw)
+        io.execute {
+            try {
+                dir.mkdirs()
+                val f = File(dir, d.id.hex())
+                if (!f.exists() || f.length() != d.raw.size.toLong()) writeAtomic(f, d.raw)
+            } catch (e: IOException) {
+                // kept in memory; lost on restart
+            }
+        }
         val out = arrayListOf(d)
         val dropped = ArrayList<Dict>()
         val kinds = HashMap<Pair<String, Boolean>, Int>()
@@ -234,7 +243,7 @@ internal class DictStore(dir: File) {
             if (n > DICT_KEEP) dropped.add(x) else out.add(x)
         }
         for (x in dropped) { // one file serves the same bytes kept as another kind
-            if (out.none { same(it.id, x.id) }) File(dir, x.id.hex()).delete()
+            if (out.none { same(it.id, x.id) }) io.execute { File(dir, x.id.hex()).delete() }
         }
         dicts = out
         gen++
@@ -246,7 +255,13 @@ internal class DictStore(dir: File) {
         val lines = dicts.joinToString("") { x ->
             x.id.hex() + (if (x.peer.isNotEmpty()) " ${x.peer} ${if (x.own) "own" else "their"}" else "") + "\n"
         }
-        writeAtomic(File(dir, "order"), lines.toByteArray())
+        io.execute {
+            try {
+                dir.mkdirs()
+                writeAtomic(File(dir, "order"), lines.toByteArray())
+            } catch (e: IOException) {
+            }
+        }
     }
 
     /** list is what peer sees of our dictionaries, newest first: the common ones and the pair's. */
@@ -297,11 +312,11 @@ internal class DictStore(dir: File) {
         val drop = dicts.filter { it.peer == peer }
         if (drop.isEmpty()) return
         dicts = dicts.filter { it.peer != peer }
-        for (d in drop) if (dicts.none { same(it.id, d.id) }) File(dir, d.id.hex()).delete()
+        for (d in drop) if (dicts.none { same(it.id, d.id) }) io.execute { File(dir, d.id.hex()).delete() }
         slots.remove(peer)
         cache.remove(peer)
         gen++
-        try { saveOrder() } catch (e: IOException) { }
+        saveOrder()
     }
 }
 

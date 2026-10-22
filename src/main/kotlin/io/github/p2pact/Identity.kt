@@ -125,10 +125,16 @@ data class Peer(
 /** phone reports a phone OS: a phone is never the family parent. */
 fun phone(os: String?) = os == "android" || os == "ios"
 
-/** Trust is the set of known devices in dir/net-peers.json (the same format as p2pact-go). */
+/**
+ * Trust is the set of known devices in dir/net-peers.json (the same format as p2pact-go). The
+ * file is written on a thread of its own, in order: callers never wait for the disk.
+ */
 class Trust(dir: File) {
     private val file = File(dir, "net-peers.json")
     private val peers = HashMap<String, Peer>()
+    private val writer = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "p2pact-trust").apply { isDaemon = true }
+    }
 
     init {
         try {
@@ -194,12 +200,20 @@ class Trust(dir: File) {
                 p.via?.let { put("via", it) }
             }
         }
-        try {
-            file.parentFile?.mkdirs()
-            writeAtomic(file, Json.write(list, "  ").toByteArray())
-        } catch (e: IOException) {
-            // kept in memory; the next change writes it again
+        val b = Json.write(list, "  ").toByteArray()
+        writer.execute {
+            try {
+                file.parentFile?.mkdirs()
+                writeAtomic(file, b)
+            } catch (e: IOException) {
+                // kept in memory; the next change writes it again
+            }
         }
+    }
+
+    /** flush waits until every change is on disk. */
+    fun flush() {
+        try { writer.submit {}.get() } catch (e: Exception) { }
     }
 }
 

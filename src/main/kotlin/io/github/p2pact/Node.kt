@@ -156,7 +156,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val peers = HashMap<String, PeerState>()
     private val handlers = HashMap<Pair<Int, Int>, Handler>()
     private val resetAt = HashMap<String, Long>()
-    private val dicts = DictStore(dir)
+    private val dicts = DictStore(dir, io)
     private val learner = Learner(dir, dicts, timing, io, trainer, ::post) { d -> addDictLocal(d) }
     private var woken = false
     @Volatile private var closed = false
@@ -273,6 +273,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         trainer.shutdownNow()
         io.shutdown()
         try { io.awaitTermination(2, TimeUnit.SECONDS) } catch (e: InterruptedException) { }
+        trust.flush()
     }
 
     /** handle registers method tool.method. */
