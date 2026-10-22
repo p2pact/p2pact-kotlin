@@ -57,6 +57,23 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
 - `dictState(peer)` tells which dictionary compresses what we send; `noLearning` turns
   training off, `noCompression` compression.
 - `befriend` adds a device known from the family book, without pairing; `forget` drops one.
+- `attachRoad` — a road your app provides: Bluetooth LE GATT, a serial line, a pipe (spec §3).
+  The app implements `AppRoad.send` and hands what arrives to `receive`:
+
+  ```kotlin
+  // GATT: ordered and acknowledged, writes of ATT MTU − 3 bytes — a stream road
+  val ble = node.attachRoad(peerAddr, AppRoad { chunk -> gattWrite(chunk) },  // may block until written
+      AppRoadConfig("ble", stream = true, mtu = mtu - 3, rate = 40 shl 10))
+  // in onCharacteristicWriteRequest / onCharacteristicChanged:
+  ble.receive(value)
+  // the link dropped:
+  ble.detach()
+  ```
+
+  `peerAddr` is the device the link reaches if the app knows it (from its advertisement); `null`
+  — learnt from the first handshake on it, and offered to `join` for pairing. The road is used
+  while nothing better is up; the session moves to UDP, TCP or a relay as soon as one answers
+  and comes back when they fall silent.
 
 All protocol state lives on one thread; roads receive on their own threads, training and
 file writes run on threads of their own, so sending never waits for them.
@@ -65,17 +82,17 @@ file writes run on threads of their own, so sending never waits for them.
 
 Identity and keys, invites, known devices (`net-key.json`, `net-peers.json` in p2pact-go's
 format, replaced atomically), pairing (`Noise_XXpsk2`), sessions (`Noise_IK` with data in the
-first packet, replay protection, restarts), UDP, TCP and relay roads, delivery (parts, ack
-ranges, streams, congestion window, RACK on unreliable roads only), CBOR calls, results, errors
-and events, compression with the common dictionary and pair-scoped ones (stable slots,
-proactive fetch, a missing dictionary held and fetched), own dictionaries learnt off the
-sending path and trained in a lull.
+first packet, replay protection, restarts), UDP, TCP and relay roads, roads the app provides
+(datagram or stream: Bluetooth LE), delivery (parts, ack ranges, streams, congestion window,
+RACK on unreliable roads only), CBOR calls, results, errors and events, compression with the
+common dictionary and pair-scoped ones (stable slots, proactive fetch, a missing dictionary held
+and fetched), own dictionaries learnt off the sending path and trained in a lull.
 
 Own dictionaries are trained by zstd's own trainer (`ZDICT_trainFromBuffer`, fastCover — the
 algorithm of `zstd --train`), which writes the standard dictionary format the spec requires.
 
 Not yet: key renewal every 2 hours, short names (`0.4 alias`), forwarding via a third device,
-the family tool, Bluetooth.
+the family tool.
 
 ## Develop
 

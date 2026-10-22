@@ -9,10 +9,17 @@
 //   {"cmd":"call","peer":"…","data":"<base64>","stream":N}    → {"data":"<base64>"}  (echo, tool 64 method 1)
 //   {"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //   {"cmd":"dict-state","peer":"…"}                           → {"own":"<base64>"|null,"using":…,"training":bool}
+//   {"cmd":"road","listen":"127.0.0.1:0","mtu":20,"rate":N}   → {"road":"127.0.0.1:…"}
+//   {"cmd":"road","dial":"127.0.0.1:…","mtu":20,"rate":N,"peer":"…"} → {"ok":true}
+//     an application road (stream) over a local TCP connection that stands in for a Bluetooth LE
+//     link: writes of at most mtu bytes, paced to rate bytes a second (0 — not paced); the
+//     listening side attaches the first connection it accepts; peer optional (bound road)
 //   {"cmd":"close"}
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
 package io.github.p2pact.interop
 
+import io.github.p2pact.AppRoad
+import io.github.p2pact.AppRoadConfig
 import io.github.p2pact.Errors
 import io.github.p2pact.Invite
 import io.github.p2pact.Json
@@ -20,6 +27,10 @@ import io.github.p2pact.Node
 import io.github.p2pact.P2pactError
 import io.github.p2pact.RelayHint
 import java.io.File
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.nio.file.Files
 import java.util.Base64
 import java.util.concurrent.ExecutionException
@@ -74,6 +85,29 @@ fun main(argv: Array<String>) {
                     say(mapOf("own" to st.own?.let { enc.encodeToString(it) }, "using" to st.using?.let { enc.encodeToString(it) },
                         "training" to st.training))
                 }
+                "road" -> {
+                    val cfg = AppRoadConfig("ble", stream = true, mtu = (req["mtu"] as Number).toInt(), rate = (req["rate"] as? Number)?.toInt() ?: 0)
+                    val listen = req["listen"] as? String
+                    if (listen != null) {
+                        val i = listen.lastIndexOf(':')
+                        val ss = ServerSocket()
+                        ss.bind(InetSocketAddress(InetAddress.getByName(listen.substring(0, i)), listen.substring(i + 1).toInt()))
+                        Thread {
+                            try {
+                                val c = ss.accept()
+                                ss.close()
+                                linkRoad(node, c, null, cfg)
+                            } catch (e: Exception) {
+                            }
+                        }.apply { isDaemon = true }.start()
+                        say(mapOf("road" to "${ss.inetAddress.hostAddress}:${ss.localPort}"))
+                    } else {
+                        val dial = req["dial"] as String
+                        val i = dial.lastIndexOf(':')
+                        linkRoad(node, Socket(dial.substring(0, i), dial.substring(i + 1).toInt()), req["peer"] as? String, cfg)
+                        say(mapOf("ok" to true))
+                    }
+                }
                 "close" -> {
                     node.close()
                     exitProcess(0)
@@ -87,4 +121,48 @@ fun main(argv: Array<String>) {
     }
     node.close()
     exitProcess(0)
+}
+
+/** PipeLink is a Bluetooth LE link stood in for by a TCP connection: send writes at most the MTU at a time, at the link's rate. */
+private class PipeLink(val socket: Socket, val rate: Int) : AppRoad {
+    private val os = socket.getOutputStream()
+    private var free = 0L
+
+    override fun send(b: ByteArray) {
+        if (rate > 0) {
+            val now = System.nanoTime()
+            if (free < now - 10_000_000) free = now // idle: the link starts now (an oversleep does not slow it)
+            free += b.size * 1_000_000_000L / rate
+            val wait = free - System.nanoTime()
+            if (wait > 2_000_000) Thread.sleep(wait / 1_000_000, (wait % 1_000_000).toInt())
+        }
+        os.write(b)
+        os.flush()
+    }
+}
+
+/** linkRoad attaches a connection as an application road and feeds it what arrives, in pieces of at most the MTU, as GATT delivers them. */
+private fun linkRoad(node: Node, socket: Socket, peer: String?, cfg: AppRoadConfig) {
+    socket.tcpNoDelay = true
+    val road = try {
+        node.attachRoad(peer, PipeLink(socket, cfg.rate), cfg)
+    } catch (e: Exception) {
+        socket.close()
+        throw e
+    }
+    Thread({
+        val inp = socket.getInputStream()
+        val buf = ByteArray(cfg.mtu)
+        try {
+            while (true) {
+                val k = inp.read(buf)
+                if (k < 0) break
+                road.receive(buf.copyOf(k))
+            }
+        } catch (e: Exception) {
+        } finally {
+            road.detach()
+            socket.close()
+        }
+    }, "p2pact-interop-link").apply { isDaemon = true }.start()
 }

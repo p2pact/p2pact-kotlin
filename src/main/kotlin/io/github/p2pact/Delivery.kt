@@ -33,6 +33,9 @@ internal const val CWND_MIN = 32.0
 internal const val CWND_MAX = 4096.0
 internal const val GOT_MAX = 8192 // parts held above the first gap
 internal const val MSG_MAX = 16 shl 20 // longer messages abort reassembly
+// how much of an application road's rate may be in flight: the first window on a slow link
+// (Bluetooth), and a bound on the queue in it that the timers wait behind
+internal const val LINK_QUEUE = SEC
 
 internal class Part(
     var seq: Long,
@@ -49,6 +52,7 @@ internal class Part(
     var sent = 0L
     var tries = 0
     var delivered = 0L // bytes delivered when this part was sent: its ack gives a rate sample
+    var busy = false // the link was busy when it was sent: other parts were in flight ahead of it
 }
 
 internal class RPart(
@@ -81,7 +85,8 @@ internal class Delivery {
     // delivery rate, as in BBR: bytes acknowledged per second, the maximum of recent samples
     var delivered = 0L
     var inflightBytes = 0L
-    var reliable = false // the current road is a reliable stream: no window of our own
+    var reliable = false // the current road is a reliable stream: nothing is lost on it
+    var link = 0.0 // the current road is an application's slow link: its rate to plan with, bytes/s
     var bw = 0.0
     var bwAt = 0L
 
@@ -124,6 +129,8 @@ internal class Delivery {
      * bandwidth-delay product while a queue is building.
      */
     fun canSend(): Boolean {
+        // an application road (Bluetooth): about a second of the link in flight
+        if (link > 0 && inflightBytes >= (linkRate() * LINK_QUEUE / SEC).toLong() + MAX_PART) return false
         if (reliable) return inflight.size < CWND_MAX // the road controls congestion itself
         if (inflight.size >= cwnd.toInt()) return false
         if (queueing() && bw > 0 && minRTT > 0) {
@@ -139,7 +146,16 @@ internal class Delivery {
      */
     fun timeout(p: Part, ahead: Long): Long {
         var t = rto()
-        if (bw > 0) t += (ahead * MAX_PART / bw * SEC).toLong()
+        if (link > 0) {
+            // a slow application road: the part itself takes link time too (tens of milliseconds,
+            // more than a round trip of small packets shows), its packet and framing count, and a
+            // lone part's ack may wait ACK_DELAY. Twice that: the rate is a maximum of samples that
+            // acks arriving in bunches inflate, and a timer that fires on the link's queue sends the
+            // part again behind it, while a late one costs little where nothing is lost
+            t += ACK_DELAY + 2 * ((ahead + 1) * (MAX_PART + 64) / linkRate() * SEC).toLong()
+        } else if (bw > 0) {
+            t += (ahead * MAX_PART / bw * SEC).toLong()
+        }
         val backoff = if (queueing()) p.tries - 1 else maxOf(0, p.tries - 3)
         var i = 0
         while (i < backoff && t < RTO_MAX) {
@@ -148,6 +164,9 @@ internal class Delivery {
         }
         return minOf(t, RTO_MAX)
     }
+
+    /** linkRate is the rate the link delivers at: as measured, else what an application road declares (0 — unknown). */
+    fun linkRate(): Double = if (bw > 0) bw else link
 
     /** sample takes a round-trip measurement (Karn's rule); a grown round trip leaves slow start. */
     private fun sample(rtt: Long) {
@@ -287,6 +306,7 @@ internal class Delivery {
             b.bytes(p.data)
             p.copies.add(now)
             p.delivered = delivered
+            p.busy = inflightBytes - p.data.size >= 2 * MAX_PART
             p.sent = now
             p.tries++
         }
@@ -348,13 +368,22 @@ internal class Delivery {
                 if (p.timer && now - p.sent < minRTT) {
                     for ((i, c) in p.copies.withIndex()) if (i == 0 || now - c >= minRTT) sent = c
                     sample(now - sent)
+                } else if (p.tries > 1 && reliable && link > 0) {
+                    // an application stream road loses nothing and keeps order: the first copy
+                    // arrived first, and this ack is for it — a round-trip sample, so the timer
+                    // catches up with the link (if it went on a road that lost it, the sample is
+                    // only too long)
+                    sample(now - p.copies[0])
                 }
                 if (sent > newest) newest = sent
                 delivered += p.data.size
                 if (p.tries == 1) {
                     sample(now - p.sent)
                     val dt = now - p.sent
-                    if (dt > 0) rate(now, (delivered - p.delivered).toDouble() / dt * SEC)
+                    // on an application road only a part sent behind others measures the link: a
+                    // lone one comes back in a round trip that says nothing of its rate (on a link
+                    // with no latency it would claim many times the rate)
+                    if (dt > 0 && (link == 0.0 || p.busy)) rate(now, (delivered - p.delivered).toDouble() / dt * SEC)
                 }
                 inflight.remove(seq)
                 inflightBytes -= p.data.size
@@ -387,10 +416,15 @@ internal class Delivery {
                 }
                 if (anyLost) lost(now)
             }
-            // fast retransmit: three parts after the gap arrived, so the gap is lost
+            // fast retransmit: three parts after the gap arrived, so the gap is lost. On an
+            // application road a copy already resent waits behind the link's queue: the acks that
+            // keep showing the gap meanwhile do not mean it is lost again, so it goes again only a
+            // round trip later
             if (beyond > 0 && !reliable) {
                 val p = inflight[upto + 1]
-                if (p != null && (beyond >= 3 || now - p.sent >= maxOf(srtt / 4, ACK_DELAY))) p.sent = 0
+                if (p != null && (beyond >= 3 || now - p.sent >= maxOf(srtt / 4, ACK_DELAY)) &&
+                    (link == 0.0 || p.tries == 1 || now - p.sent >= srtt)
+                ) p.sent = 0
             }
         }
         if (flags and F_MSG == 0) return true

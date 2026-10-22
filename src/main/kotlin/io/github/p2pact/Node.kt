@@ -18,6 +18,9 @@ private const val ALIVE_FOR = 60 * SEC // a road is alive if something arrived o
 private const val KEEPALIVE_GAP = 25 * SEC
 private const val SESSION_IDLE = 180 * SEC
 
+/** probeEvery: how often the direct roads are tried while a session runs over a relay or an application road (spec §7); tests shorten it. */
+@Volatile internal var probeEvery = 30 * SEC
+
 /** Error codes (spec §6). */
 object Errors {
     const val NO_METHOD = 1
@@ -79,6 +82,7 @@ private class PeerState(val addr: String) {
     var boot = 0L // the other device's boot id (from the handshake)
     var heard = false // it knows our boot id: sent us session data or answered our handshake
     var lastInit = 0L
+    var lastProbe = 0L // the direct roads were last tried while the session ran over a relay or an application road
     val calls = HashMap<Long, CompletableFuture<List<Any?>>>()
     var callID = 0L
     var dicts: List<ByteArray> = emptyList() // its dictionaries (ids), by slot — from its hello and 0.5
@@ -160,6 +164,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private var tcp: TcpRoad? = null
     private var ownRelay: RelayHint? = null
     private val relays = HashMap<String, RelayRoad>() // by server address
+    private val apps = LinkedHashSet<AttachedRoad>() // roads the application provides
     private var advertise: Hints? = null
 
     private val sessions = HashMap<Long, Session>() // by our index
@@ -275,6 +280,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 udp?.close()
                 tcp?.close()
                 for (r in relays.values) r.close()
+                for (a in apps.toList()) a.detach()
                 for (ps in peers.values) for (c in ps.calls.values) c.completeExceptionally(IllegalStateException("node closed"))
                 for (h in hs.values) h.done?.completeExceptionally(IllegalStateException("node closed"))
             }
@@ -317,6 +323,9 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 r = relay(it).also { rr -> rr.join(inv.id.hex(), "b") }
                 eps.add(Endpoint(r!!, inv.id.hex()))
             }
+            // a link the application opened to a device it has not named
+            val owner = Crypto.address(inv.key)
+            for (a in apps) if (a.peer == null || a.peer == owner) eps.add(a.endpoint)
             if (eps.isEmpty()) {
                 done.completeExceptionally(IllegalStateException("the invite has no road we can use"))
                 return@post
@@ -494,7 +503,12 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         if (current[s.peer] == null) current[s.peer] = s
         val ps = peerState(s.peer) ?: return
         ps.heard = true
+        // a packet on a better road than the one in use (a probe, spec §7) is answered on it: the
+        // other side hears the road too, and both move to it
+        val c = candidates(s.peer, ps, now, false)
+        val better = c.size == 1 && roadRank(from.road) < roadRank(c[0].ep.road)
         seen(ps, from, now, s.local)
+        if (better) sealTo(s, ps.eps[from.key]!!, now, keepalive())
         ps.st.receive(now, plain) { m, z, st -> inbound(s.peer, m, z, st) }
         if (ps.st.ackDue != 0L && now >= ps.st.ackDue) wake() // an ack is due now
     }
@@ -781,10 +795,9 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             if (mine.isNotEmpty()) alive = mine
         }
         if (alive.isNotEmpty() && !all) {
-            fun rank(e: EpState) = when (e.ep.road.name) { "udp" -> 0; "tcp" -> 1; else -> 2 }
             // the road heard from last; a better kind only if heard within half a second of it (spec §7)
             var best = alive.maxByOrNull { it.lastRecv }!!
-            for (e in alive) if (rank(e) < rank(best) && best.lastRecv - e.lastRecv < 500 * MS) best = e
+            for (e in alive) if (roadRank(e.ep.road) < roadRank(best.ep.road) && best.lastRecv - e.lastRecv < 500 * MS) best = e
             return listOf(best)
         }
         val out = ArrayList(alive)
@@ -796,7 +809,77 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         udp?.let { u -> p.hints.udp.forEach { add(Endpoint(u, it)) } }
         tcp?.let { t -> p.hints.tcp.forEach { add(Endpoint(t, it)) } }
         pairRelay(p)?.let { add(Endpoint(it, p.relayChannel)) }
+        for (a in apps) if (a.peer == peer) add(a.endpoint) // a road the application opened to this device
         return out
+    }
+
+    /** roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application provides. */
+    private fun roadRank(r: Road): Int = if (r is AttachedRoad) 3 else when (r.name) { "udp" -> 0; "tcp" -> 1; else -> 2 }
+
+    /** sealTo sends packet content on one endpoint only (a keepalive, a probe). */
+    private fun sealTo(s: Session, e: EpState, now: Long, plain: ByteArray) {
+        if (e.ep.road.send(e.ep.addr, seal(s, plain))) e.lastSend = now
+    }
+
+    /**
+     * probe tries the direct roads to a device while the session runs over a relay or a road the
+     * application provides (spec §7): a keepalive to every UDP and TCP address known for it, every
+     * [probeEvery]. The one that answers is live, and being better it takes over.
+     */
+    private fun probe(now: Long, peer: String, ps: PeerState, s: Session) {
+        if (now - ps.lastProbe < probeEvery) return
+        val c = candidates(peer, ps, now, false)
+        if (c.size != 1 || roadRank(c[0].ep.road) < 2) return
+        ps.lastProbe = now
+        for (e in candidates(peer, ps, now, true)) if (roadRank(e.ep.road) < 2) sealTo(s, e, now, keepalive())
+    }
+
+    // --- application roads ---
+
+    /**
+     * attachRoad attaches a road the application provides (spec §3): Bluetooth LE GATT, a serial
+     * line, a pipe. peer is the device it reaches, when the application knows it (it found that
+     * device's Bluetooth advertisement, say): the node sends to it on this road like on its hints,
+     * and starts a session over it at once if it has none. With peer null the road is bound by what
+     * arrives on it: a handshake or session packet names the device, and the answers go back the
+     * same way; until then it is offered for pairing ([join]). The road ranks below UDP, TCP and a
+     * relay: it carries the session while nothing better is up, and the session moves to a better
+     * road as soon as one answers (spec §7).
+     */
+    fun attachRoad(peer: String?, road: AppRoad, config: AppRoadConfig): AttachedRoad {
+        require(config.mtu >= 1) { "an application road needs an MTU" }
+        require(config.stream || config.mtu >= MAX_ROAD_PACKET) {
+            "a datagram road must carry $MAX_ROAD_PACKET bytes; a smaller link that keeps order is a stream road"
+        }
+        if (peer != null && trust.get(peer) == null) throw IllegalArgumentException("unknown device")
+        val a = AttachedRoad(road, config, peer, ::receiveFromRoad) { r -> post { detached(r) } }
+        onLoop {
+            apps.add(a)
+            if (peer != null) appAttached(Clock.nanos(), a)
+        }
+        return a
+    }
+
+    /**
+     * appAttached starts using a road the application attached for a device: a keepalive over it
+     * when there is a session (so the other side binds it too), a handshake when not.
+     */
+    private fun appAttached(now: Long, a: AttachedRoad) {
+        val peer = a.peer ?: return
+        val ps = peerState(peer) ?: return
+        val e = ps.eps.getOrPut(a.endpoint.key) { EpState(a.endpoint) }
+        val s = current[peer]
+        if (s != null) {
+            sealTo(s, e, now, keepalive())
+            return
+        }
+        ps.lastInit = 0
+        startInit(now, peer, ps, if (ps.st.idle()) null else ps.st.nextPacket(now, false)?.plain)
+    }
+
+    private fun detached(a: AttachedRoad) {
+        apps.remove(a)
+        for (ps in peers.values) ps.eps.entries.removeIf { it.value.ep.road === a }
     }
 
     /** pairRelay picks the pair's relay: the one of the lower address, else the other's. */
@@ -866,7 +949,11 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 continue
             }
             val c = candidates(peer, ps, now, false)
-            if (c.size == 1) ps.st.reliable = c[0].ep.road.name != "udp"
+            if (c.size == 1) {
+                val r = c[0].ep.road
+                ps.st.reliable = if (r is AttachedRoad) r.config.stream else r.name != "udp"
+                ps.st.link = if (r is AttachedRoad) r.rate else 0.0
+            }
             var i = 0
             while (true) {
                 if (i++ == 256) { // a burst at a time; the rest on the next wake
@@ -889,7 +976,9 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         for (p in trust.list()) {
             val ps = peerState(p.addr) ?: continue
             pairRelay(p)?.join(p.relayChannel, if (p.addr < id.addr) "b" else "a")
-            if (current[p.addr] == null && now - ps.lastInit >= AUTO_CONNECT) startInit(now, p.addr, ps, null)
+            val s = current[p.addr]
+            if (s == null && now - ps.lastInit >= AUTO_CONNECT) startInit(now, p.addr, ps, null)
+            if (s != null) probe(now, p.addr, ps, s)
         }
         sessions.entries.removeIf { (_, s) -> current[s.peer] !== s && now - s.lastRecv > SESSION_IDLE }
         hs.entries.removeIf { now - it.value.at > 60 * SEC }
