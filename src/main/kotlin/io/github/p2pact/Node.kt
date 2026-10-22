@@ -758,7 +758,11 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                     post {
                         // the result goes back on the call's stream, unless the caller restarted meanwhile
                         val p = peerState(peer)
-                        if (p != null && (boot == 0L || p.boot == boot)) push(p, b, stream, tool != 0, reply = true)
+                        if (p != null && (boot == 0L || p.boot == boot)) {
+                            // a hello, like the event: never compressed (spec §5)
+                            if (tool == 0 && method == 2) { p.st.push(b, false, stream, true); wake() }
+                            else push(p, b, stream, tool != 0, reply = true)
+                        }
                     }
                 }
                 val run: () -> Unit = {
@@ -1097,7 +1101,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      * conversation (not tool 0), so it goes to the history.
      */
     private fun push(ps: PeerState, msg: ByteArray, stream: Long, talk: Boolean, reply: Boolean = false) {
-        if (noCompression) {
+        if (noCompression || bootstrap(msg)) {
             ps.st.push(msg, false, stream, reply)
         } else {
             val (d, slot) = dicts.pick(ps.addr, ps.dicts, ps.lacks)
@@ -1287,6 +1291,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 private fun idsOf(v: Any?): List<ByteArray> = v.asList()?.mapNotNull { it as? ByteArray } ?: emptyList()
 
 /** outOfOrder: results and errors of our calls, hellos and dictionary lists may skip the queue. */
+/**
+ * bootstrap: a hello or a dictionary list ([3, 0, 2|5, …]) carries what the receiver needs to
+ * decompress, so it always goes uncompressed — a device that restarted must be able to read it.
+ */
+internal fun bootstrap(m: ByteArray): Boolean =
+    m.size > 3 && m[1].toInt() == 3 && m[2].toInt() == 0 && (m[3].toInt() == 2 || m[3].toInt() == 5)
+
 private fun outOfOrder(m: ByteArray): Boolean {
     if (m.size < 2) return false
     return m[1].toInt() == 1 || m[1].toInt() == 2 || (m.size > 3 && m[1].toInt() == 3 && m[2].toInt() == 0 && (m[3].toInt() == 2 || m[3].toInt() == 5))
