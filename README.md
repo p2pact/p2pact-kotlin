@@ -21,6 +21,17 @@ A Kotlin/JVM library (JVM 17 bytecode), usable on Android API 26+. Dependencies:
 
 Noise, CBOR and the small JSON reader for the device files are implemented here.
 
+## Install
+
+```kotlin
+dependencies {
+    implementation("io.github.p2pact:p2pact-kotlin:0.1.0") // the protocol
+    implementation("io.github.p2pact:p2pact-client:0.1.0")  // the client SDK (brings the protocol)
+}
+```
+
+From Maven Central (`mavenCentral()`). On Android also add `com.github.luben:zstd-jni:1.5.7-6@aar`.
+
 ## Use
 
 ```kotlin
@@ -137,6 +148,23 @@ The relay test runs against p2pact-go's relay (`cmd/p2pact-relay`):
 ```sh
 P2PACT_RELAY="127.0.0.1:8443 <fingerprint>" ./gradlew test --tests '*RelayTest'
 ```
+
+## Publishing
+
+For maintainers. `.github/workflows/publish.yml` runs on a `v*` tag (or by hand): tests, then
+`./gradlew publishToMavenCentral` for both artifacts (sources and javadoc jars, signed, released
+automatically). Before the first tag:
+
+- Central Portal (central.sonatype.com): sign in with GitHub, register the namespace
+  `io.github.p2pact` and verify it (GitHub organisation `p2pact`), then Account, Generate User
+  Token. Repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_PASSWORD` are the token's
+  username and password.
+- GPG: `gpg --full-generate-key`, publish the public key (`gpg --keyserver keyserver.ubuntu.com
+  --send-keys <id>`), then `gpg --armor --export-secret-keys <id>` goes to the secret `SIGNING_KEY`
+  and its passphrase to `SIGNING_PASSWORD`.
+- The tag must equal `v` + `version` in `build.gradle.kts`: `git tag v0.1.0 && git push origin v0.1.0`.
+
+Locally: `./gradlew publishToMavenLocal` (JDK 17) builds and installs unsigned artifacts into `~/.m2`.
 
 ## License
 
