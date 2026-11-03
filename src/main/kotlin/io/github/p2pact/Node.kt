@@ -751,6 +751,22 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         }
     }
 
+    /**
+     * afterEvents completes when everything already received from the device on the stream (its
+     * events and calls) has run through [onEvent] and the handlers. A call's result completes as
+     * it arrives, ahead of the events queued before it: a client that must have all of them
+     * (a chat's history before the answer to `session/load`) waits for this after the result.
+     */
+    fun afterEvents(peer: String, stream: Long = 0): CompletableFuture<Unit> {
+        val f = CompletableFuture<Unit>()
+        post {
+            val ps = peerState(peer)
+            if (ps == null) f.complete(Unit) else enqueue(ps, stream) { f.complete(Unit) }
+        }
+        if (closed) f.complete(Unit)
+        return f
+    }
+
     /** sendInfoForTest sends our hello again (tests: a changed kind, tools). */
     internal fun sendInfoForTest(peer: String) = onLoop { sendInfo(peer) }
 
