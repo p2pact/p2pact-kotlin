@@ -213,6 +213,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val current = HashMap<String, Session>() // the best session with a device
     private val hs = HashMap<Long, PendingHs>()
     private val invites = HashMap<String, Invite>() // our invites by id (hex)
+    // invites made for programs (pluginInvite) and the grants their install gave
+    private val inviteGrants = HashMap<String, List<Grant>>()
+    private var loc: StreamRoad? = null // the local socket road (Local.kt)
+    private var localPath: String? = null // the socket we listen on, or dial
     private val peers = HashMap<String, PeerState>()
     private val handlers = HashMap<Pair<Int, Int>, Handler>()
     // named tools: name → number and back, versions
@@ -305,6 +309,64 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     val udpRoad: UdpRoad? get() = onLoop { udp }
     val tcpRoad: TcpRoad? get() = onLoop { tcp }
 
+    /**
+     * listenLocal opens the local socket at path (spec §3): a Unix domain socket readable and
+     * writable by our OS user only (mode 0600). An old socket file nobody listens on is replaced.
+     * Needs Java 16+: on a runtime without Unix sockets (Android) it throws
+     * [UnsupportedOperationException] (see [localSocketsSupported]).
+     */
+    fun listenLocal(path: String) {
+        require(path.isNotEmpty()) { "no socket path" }
+        onLoop {
+            check(loc == null) { "the local socket is already in use" }
+            loc = LocalRoad.listen(path, ::receiveFromRoad)
+            localPath = path
+        }
+    }
+
+    /**
+     * useLocal makes the node reach a device on this computer over its local socket at path:
+     * [join] and the session use it. The node does not listen. Same runtime needs as [listenLocal].
+     */
+    fun useLocal(path: String) {
+        require(path.isNotEmpty()) { "no socket path" }
+        onLoop {
+            check(loc == null) { "the local socket is already in use" }
+            loc = LocalRoad.dialer(::receiveFromRoad)
+            localPath = path
+        }
+    }
+
+    /** localPath is the path of the local socket: the one we listen on, or the one we dial (null — none). */
+    fun localPath(): String? = onLoop { localPath }
+
+    /** isLocal reports a packet that came over our local socket. */
+    private fun isLocal(from: Endpoint) = loc != null && from.road === loc
+
+    /**
+     * pluginInvite makes the invite for a program the device starts (spec §2): single use, no
+     * hints (the program reaches the device over the local socket), valid for ttlMs, and the
+     * program is granted exactly grants — the install gave them, nobody is asked. The program
+     * must pair with kind [Kind.PLUGIN] over the local socket; it is never added to the family and
+     * never reached over another road.
+     */
+    fun pluginInvite(ttlMs: Long, grants: List<Grant>): Invite = onLoop {
+        val inv = Invite(id.key.public, name, randomBytes(32), System.currentTimeMillis() + ttlMs, Hints())
+        invites[inv.id.hex()] = inv
+        inviteGrants[inv.id.hex()] = cleanGrants(grants)
+        inv
+    }
+
+    /**
+     * pluginEnv is [pluginInvite] and the environment to start the program with, "NAME=value":
+     * P2PACT_SOCKET and P2PACT_INVITE. The node must listen on its local socket.
+     */
+    fun pluginEnv(ttlMs: Long, grants: List<Grant>): List<String> {
+        val path = localPath()
+        check(path != null) { "the node does not listen on a local socket" }
+        return listOf("$ENV_SOCKET=$path", "$ENV_INVITE=${pluginInvite(ttlMs, grants)}")
+    }
+
     /** setRelay sets our relay: used for pairing and pair channels. */
     fun setRelay(h: RelayHint?) = onLoop { ownRelay = h }
 
@@ -332,6 +394,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 tcp?.close()
                 for (r in relays.values) r.close()
                 for (a in apps.toList()) a.detach()
+                loc?.close()
                 for (ps in peers.values) for (c in ps.calls.values) c.completeExceptionally(IllegalStateException("node closed"))
                 for (h in hs.values) h.done?.completeExceptionally(IllegalStateException("node closed"))
             }
@@ -540,6 +603,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 r = relay(it)
                 eps.add(Endpoint(r!!, inv.id.hex()))
             }
+            // a device on this computer, over its socket
+            val lr = loc
+            val lp = localPath
+            if (lr != null && lp != null) eps.add(Endpoint(lr, lp))
             // a link the application opened to a device it has not named
             val owner = Crypto.address(inv.key)
             for (a in apps) if (a.peer == null || a.peer == owner) eps.add(a.endpoint)
@@ -617,6 +684,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
 
     /** befriend adds a device known from the family book without pairing: the pair secret comes from both keys. */
     fun befriend(p: Peer) {
+        require(p.kind != Kind.PLUGIN) { "a plugin is never in the family" }
         require(p.key.size == 32 && Crypto.address(p.key) == p.addr) { "key does not match address" }
         val old = trust.get(p.addr)
         if (old != null) {
@@ -780,7 +848,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val payload = h.readMessage(pkt.copyOfRange(5, pkt.size))
         if (payload.size < 12) return
         val peer = Crypto.address(h.rs!!)
-        if (trust.get(peer) == null) return // silence to strangers
+        val known = trust.get(peer) ?: return // silence to strangers
+        if (known.kind == Kind.PLUGIN && !isLocal(from)) return // a plugin is reachable over the local socket only (spec §2)
         val ps = peerState(peer) ?: return
         val ts = u64(payload, 0)
         val age = System.currentTimeMillis() * MS - ts
@@ -862,7 +931,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val hints = Hints(
             udp = wh.udp.ifEmpty { inv.hints.udp }, tcp = wh.tcp.ifEmpty { inv.hints.tcp }, relay = wh.relay ?: inv.hints.relay,
         )
-        val p = Peer(peer, inv.key, pp.name, inv.secret, hints, signKey = pp.signKey, os = pp.os, kind = pp.kind)
+        val p = Peer(peer, inv.key, pp.name, inv.secret, hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, local = isLocal(from))
         trust.put(p)
         val s = Session(peer, local, u32(pkt, 5), c1, c2, now)
         sessions[local] = s
@@ -882,20 +951,30 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         if (!h.pair || h.done != null) return
         val payload = h.hs.readMessage(pkt.copyOfRange(5, pkt.size))
         val (c1, c2) = h.hs.ciphers ?: return
-        hs.remove(local)
         val inv = h.invite!!
+        val pp = parsePair(payload)
+        val preset = inviteGrants[inv.id.hex()]
+        val forProgram = preset != null
+        // a plugin pairs over the local socket only, with an invite made for programs (spec §2)
+        if ((pp.kind == Kind.PLUGIN || forProgram) && (pp.kind != Kind.PLUGIN || !isLocal(from))) return
+        hs.remove(local)
         invites.remove(inv.id.hex()) // single use
         ownRelay?.let { relay(it).leave(inv.id.hex()) }
         val key = h.hs.rs!!.copyOf()
         val peer = Crypto.address(key)
-        val pp = parsePair(payload)
-        var p = Peer(peer, key, pp.name, inv.secret, pp.hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, via = inv.id.hex())
+        var p =Peer(peer, key, pp.name, inv.secret, pp.hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, via = inv.id.hex())
         // what the newcomer may use (spec §2): without wants it asks for everything and keeps the
         // default; with them, and no onWants to narrow them, it gets what it asked. With onWants
         // the application decides: until it does the newcomer may use nothing.
         pp.wants?.let { p = p.copy(grants = cleanGrants(it)) }
-        val decide = onWants
+        var decide = onWants
         if (decide != null) p = p.copy(grants = emptyList())
+        if (preset != null) { // the install gave the grants: nobody is asked
+            decide = null
+            p = p.copy(grants = cleanGrants(preset))
+        }
+        if (pp.kind == Kind.PLUGIN) p = p.copy(hints = Hints()) // reachable over the local socket only
+        inviteGrants.remove(inv.id.hex())
         trust.put(p)
         // the joiner was the initiator; we are the responder
         val s = Session(peer, local, h.remoteIdx, c2, c1, now)
@@ -904,12 +983,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
         bootOf(ps, pp.boot)
-        if (decide != null) {
-            val wants = cleanGrants(pp.wants ?: defaultGrants())
+        val ask = decide
+        if (ask != null) {
+            val wants =cleanGrants(pp.wants ?: defaultGrants())
             val newcomer = trust.get(peer) ?: p
             sendInfo(peer)
             execute {
-                val grants = try { decide(newcomer, wants) } catch (e: Exception) { null }
+                val grants = try { ask(newcomer, wants) } catch (e: Exception) { null }
                 if (grants == null) { // refused: the newcomer is forgotten
                     forget(peer)
                 } else {
@@ -1142,6 +1222,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             val e = ps.eps.getOrPut(ep.key) { EpState(ep) }
             if (out.none { it === e }) out.add(e)
         }
+        val lr = loc
+        val lp = localPath
+        if (p.local && lr != null && lp != null) add(Endpoint(lr, lp)) // the device we dial on this computer
+        if (p.kind == Kind.PLUGIN) return out // reachable over the local socket only, on the connection it opened
         udp?.let { u -> p.hints.udp.forEach { add(Endpoint(u, it)) } }
         tcp?.let { t -> p.hints.tcp.forEach { add(Endpoint(t, it)) } }
         pairRelay(p)?.let { add(Endpoint(it, p.relayChannel)) }
@@ -1150,7 +1234,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     }
 
     /** roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application provides. */
-    private fun roadRank(r: Road): Int = if (r is AttachedRoad) 3 else when (r.name) { "udp" -> 0; "tcp" -> 1; else -> 2 }
+    private fun roadRank(r: Road): Int = if (r is AttachedRoad) 3 else when (r.name) { "udp" -> 0; "tcp", "local" -> 1; else -> 2 }
 
     /** sealTo sends packet content on one endpoint only (a keepalive, a probe). */
     private fun sealTo(s: Session, e: EpState, now: Long, plain: ByteArray) {
@@ -1329,6 +1413,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         for ((k, inv) in invites.entries.toList()) {
             if (wall > inv.exp) {
                 invites.remove(k)
+                inviteGrants.remove(k)
                 ownRelay?.let { relay(it).leave(k) }
             }
         }

@@ -122,6 +122,8 @@ data class Peer(
     val grants: List<Grant>? = null,
     /** What the device lets us use of its tools (its event 0.6); null — not told, which is ["*", 2] as well. */
     val granted: List<Grant>? = null,
+    /** We reach the device over our local socket (a plugin's host, spec §3). */
+    val local: Boolean = false,
 ) {
     /** relayChannel is the pair's relay channel: only these two devices know it (spec §3). */
     val relayChannel: String get() = Crypto.mac(pairSecret, "relay").copyOf(16).hex()
@@ -164,6 +166,7 @@ class Trust(dir: File) {
                         added = (m["added"] as? Number)?.toLong() ?: 0, signKey = unb64(m["sign_key"] as? String),
                         os = m["os"] as? String, via = m["via"] as? String, kind = (m["kind"] as? Number)?.toInt() ?: 0,
                         grants = grantsFromJson(m["grants"]), granted = grantsFromJson(m["granted"]),
+                        local = m["local"] as? Boolean ?: false,
                     )
                     if (p.key.size == 32 && Crypto.address(p.key) == p.addr) peers[p.addr] = p
                 }
@@ -244,6 +247,7 @@ class Trust(dir: File) {
                 if (p.kind != Kind.UNKNOWN) put("kind", p.kind)
                 put("grants", p.grants?.let { grantsToJson(it) }) // null: never set, the default
                 p.granted?.let { put("granted", grantsToJson(it)) }
+                if (p.local) put("local", true)
             }
         }
         val b = Json.write(list, "  ").toByteArray()
