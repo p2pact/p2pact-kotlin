@@ -95,9 +95,23 @@ class ToolEvent(val computer: Computer, val tool: String?, val toolNumber: Int, 
  * Calls return [CompletableFuture]s that fail with [P2pactException] (the P2PACT error codes) or
  * [RpcException] (the tool's own errors); [await] waits for one.
  */
-class P2pactClient(dir: File, name: String, val config: ClientConfig = ClientConfig()) : AutoCloseable {
-    /** The protocol node: for what this SDK does not wrap. Do not set its callbacks. */
-    val node: Node = Node(dir, name)
+class P2pactClient private constructor(
+    /** The protocol node: for what this SDK does not wrap. Do not set its callbacks (unless you wrapped it: see [hello]). */
+    val node: Node,
+    val config: ClientConfig,
+    /** The SDK made the node and runs it; otherwise the application does (see the wrapping constructor). */
+    private val owned: Boolean,
+) : AutoCloseable {
+    constructor(dir: File, name: String, config: ClientConfig = ClientConfig()) : this(Node(dir, name), config, true)
+
+    /**
+     * Wrapping constructor: the typed clients over a node the application already runs (it owns
+     * the keys, the roads, the pairing and the node's callbacks). The SDK only serves the chat
+     * tool's calls from the computers (`handle`, so wrap before `node.start()`); [config]'s roads
+     * are not used. The application keeps `onHello`, `onEvent`, `onGranted` and `onPaired` of the
+     * node and passes them on: [hello], [event], [granted], [paired]. [close] leaves the node open.
+     */
+    constructor(node: Node, config: ClientConfig = ClientConfig()) : this(node, config, false)
     private val computers = ConcurrentHashMap<String, Computer>()
     private val sequence = ConcurrentHashMap<String, AtomicLong>()
 
@@ -108,20 +122,40 @@ class P2pactClient(dir: File, name: String, val config: ClientConfig = ClientCon
     val toolEvents = Events<ToolEvent>()
 
     init {
-        node.kind = Kind.CLIENT
-        config.udp?.let { node.listenUdp(it) }
-        config.tcp?.let { node.listenTcp(it) }
-        config.relay?.let { node.setRelay(it) }
-        node.onPaired = { p -> if (usable(p)) computerEvents.emit(ComputerEvent.Paired(computerOf(p.addr))) }
-        node.onHello = { addr -> computerOrNull(addr)?.helloArrived() }
-        node.onGranted = { addr, g -> computerOrNull(addr)?.let { computerEvents.emit(ComputerEvent.GrantsChanged(it, g)) } }
-        node.onEvent = { addr, tool, ev, args -> dispatch(addr, tool, ev, args) }
+        if (owned) {
+            node.kind = Kind.CLIENT
+            config.udp?.let { node.listenUdp(it) }
+            config.tcp?.let { node.listenTcp(it) }
+            config.relay?.let { node.setRelay(it) }
+            node.onPaired = { p -> paired(p) }
+            node.onHello = { addr -> hello(addr) }
+            node.onGranted = { addr, g -> granted(addr, g) }
+            node.onEvent = { addr, tool, ev, args -> event(addr, tool, ev, args) }
+        }
         // the computer's calls into the chat tool: permissions and questions of agents (chat spec §6, §9.1)
         node.handle(Tools.CHAT_NUMBER, 1) { addr, args ->
             val c = computerOrNull(addr) ?: throw P2pactError(Errors.FORBIDDEN, "unknown computer")
             later(c.chat.incoming(args))
         }
-        node.start()
+        if (owned) node.start()
+    }
+
+    /** The computer's hello came (the node's `onHello`): for a wrapped node, pass it on first thing. */
+    fun hello(addr: String) {
+        computerOrNull(addr)?.helloArrived()
+    }
+
+    /** An event of a tool from a computer (the node's `onEvent`): for a wrapped node, in the order the node gave it. */
+    fun event(addr: String, tool: Int, ev: Int, args: List<Any?>) = dispatch(addr, tool, ev, args)
+
+    /** The computer told what we may use (the node's `onGranted`). */
+    fun granted(addr: String, grants: List<Grant>) {
+        computerOrNull(addr)?.let { computerEvents.emit(ComputerEvent.GrantsChanged(it, grants)) }
+    }
+
+    /** Pairing finished (the node's `onPaired`). */
+    fun paired(p: Peer) {
+        if (usable(p)) computerEvents.emit(ComputerEvent.Paired(computerOf(p.addr)))
     }
 
     private fun usable(p: Peer) = p.kind != Kind.PLUGIN && p.kind != Kind.CLIENT
@@ -155,7 +189,7 @@ class P2pactClient(dir: File, name: String, val config: ClientConfig = ClientCon
     }
 
     override fun close() {
-        node.close()
+        if (owned) node.close()
     }
 
     // --- internals ---

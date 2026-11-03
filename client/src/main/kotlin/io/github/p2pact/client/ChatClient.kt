@@ -160,9 +160,18 @@ class ChatClient internal constructor(private val computer: Computer) {
     fun setModel(sessionId: String, modelId: String): CompletableFuture<JsonMap> =
         call("session/set_model", mapOf("sessionId" to sessionId, "modelId" to modelId), streamOf(sessionId)) { it }
 
-    /** request is any ACP or extension method that has no typed call: the `result` object. */
-    fun request(method: String, params: JsonMap): CompletableFuture<JsonMap> =
-        call(method, params, streamOf(params.str("sessionId"))) { it }
+    /**
+     * request is any ACP or extension method that has no typed call: the `result` object. It rides
+     * the stream of the params' `sessionId`, or [stream] when given (0: the computer's own stream).
+     * Like [loadSession], it completes after the events the computer sent before the result have
+     * been handled.
+     */
+    fun request(method: String, params: JsonMap, stream: Long? = null): CompletableFuture<JsonMap> =
+        settledCall(method, params, stream ?: streamOf(params.str("sessionId"))) { it }
+
+    /** call, then wait for the events queued on the stream before the result (a result may come ahead of them). */
+    private fun <T> settledCall(method: String, params: JsonMap?, stream: Long, parse: (JsonMap) -> T): CompletableFuture<T> =
+        call(method, params, stream) { it }.flatMap { r -> node.afterEvents(computer.id, stream).map { r } }.map(parse)
 
     // --- extensions (chat spec §10) ---
 
@@ -171,7 +180,7 @@ class ChatClient internal constructor(private val computer: Computer) {
      * come later arrive in [reports]. A failure the person should see is the line `{"cmd":"alert"}`.
      */
     fun command(name: String, params: JsonMap = emptyMap()): CompletableFuture<List<JsonMap>> =
-        call("_p2pact/$name", params, streamOf(params.str("sessionId"))) { it.objs("lines") }
+        settledCall("_p2pact/$name", params, streamOf(params.str("sessionId"))) { it.objs("lines") }
 
     /** close closes the chat: it leaves the list. */
     fun close(sessionId: String) = command("close", mapOf("sessionId" to sessionId))
@@ -235,7 +244,8 @@ class ChatClient internal constructor(private val computer: Computer) {
                 pending.remove("$sid/$tc")?.complete(Unit)
                 requestAnswered.emit(RequestAnswered(sid, tc))
             }
-            "_p2pact/report" -> params.obj("line")?.let { reports.emit(it) }
+            // _nomad/…: an engine older than the ext flag
+            "_p2pact/report", "_nomad/report" -> params.obj("line")?.let { reports.emit(it) }
         }
     }
 
@@ -260,7 +270,7 @@ class ChatClient internal constructor(private val computer: Computer) {
                     }))
                 } 
             }
-            "_p2pact/question" -> {
+            "_p2pact/question", "_nomad/question" -> { // _nomad/…: an engine older than the ext flag
                 val h = questionHandler ?: return CompletableFuture.completedFuture(error(RpcException.METHOD_NOT_FOUND, "method not found"))
                 val sid = params.str("sessionId") ?: ""
                 val tc = params.str("toolCallId") ?: ""
