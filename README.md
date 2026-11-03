@@ -84,6 +84,24 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
 All protocol state lives on one thread; roads receive on their own threads, training and
 file writes run on threads of their own, so sending never waits for them.
 
+## Client SDK (`p2pact-client`)
+
+`client/` (`io.github.p2pact:p2pact-client`, package `io.github.p2pact.client`) is a typed client
+of the public tools of the P2PACT engine: `p2pact.chat` (ACP, tool 1), `p2pact.fleet` (tool 2)
+and `p2pact.plugins` (tool 4). Pure Kotlin/JVM on top of this library; calls return
+`CompletableFuture`, events go to `Events<T>` listeners.
+
+```kotlin
+val client = P2pactClient(File(dataDir), "My app")
+val computer = client.pair("p2pact1.…").await()        // asks for chat, fleet, plugins:read
+computer.chat.listAllSessions().await()                 // initialize goes first by itself
+computer.chat.updates.subscribe { u -> println(u) }
+computer.chat.prompt("session-id", "run the tests").await()
+```
+
+Errors are `P2pactException` (`ForbiddenException` is error 4, …) and, for the tool's own
+errors, `RpcException`. See `examples/cli` for a small program.
+
 ## Status
 
 Identity and keys, invites, known devices (`net-key.json`, `net-peers.json` in p2pact-go's
