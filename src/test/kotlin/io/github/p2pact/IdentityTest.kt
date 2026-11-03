@@ -113,4 +113,37 @@ class IdentityTest {
         assertTrue(w.accept(5000 - 2047))
         assertFalse(w.accept(5))
     }
+
+    private class MemoryStore(var bytes: ByteArray? = null) : IdentityStore {
+        var saves = 0
+        override fun load() = bytes
+        override fun save(bytes: ByteArray) { this.bytes = bytes; saves++ }
+    }
+
+    @Test
+    fun pluggableStoreKeepsTheKeysAndLeavesNoFile() {
+        val dir = tmp.newFolder()
+        val store = MemoryStore()
+        val a = Identity.load(dir, store)
+        val b = Identity.load(dir, store)
+        assertEquals(a.addr, b.addr)
+        assertEquals(1, store.saves)
+        assertFalse(File(dir, "net-key.json").exists())
+    }
+
+    @Test
+    fun pluggableStoreReadsAnExistingDocument() {
+        val dir = tmp.newFolder()
+        val a = Identity.load(dir)
+        val store = MemoryStore(File(dir, "net-key.json").readBytes())
+        assertEquals(a.addr, Identity.load(tmp.newFolder(), store).addr)
+        assertEquals(0, store.saves)
+    }
+
+    @Test
+    fun nodeUsesTheStore() {
+        val store = MemoryStore()
+        val n = Node(tmp.newFolder(), "x", identityStore = store)
+        try { assertEquals(Identity.load(tmp.newFolder(), store).addr, n.id.addr) } finally { n.close() }
+    }
 }

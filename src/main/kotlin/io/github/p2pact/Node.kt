@@ -155,9 +155,15 @@ internal fun goos(): String {
  * thread, training and history writes on their own threads: the sending path never waits for
  * them.
  */
-class Node(dir: File, val name: String, private val timing: LearnTiming = LearnTiming()) {
+class Node(
+    dir: File,
+    val name: String,
+    private val timing: LearnTiming = LearnTiming(),
+    /** Where the device keys are kept; null: dir/net-key.json. */
+    identityStore: IdentityStore? = null,
+) {
     private val dir = dir.also { it.mkdirs() }
-    val id: Identity = Identity.load(dir)
+    val id: Identity = Identity.load(dir, identityStore ?: FileIdentityStore(dir))
     val trust = Trust(dir)
 
     /**

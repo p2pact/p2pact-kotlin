@@ -26,13 +26,16 @@ class Identity(val key: KeyPair, val sign: KeyPair) {
     fun shared(pub: ByteArray, label: String): ByteArray = Crypto.mac(Crypto.x25519(key.private, pub), label)
 
     companion object {
-        /** load reads dir/net-key.json, creating the keys (owner-only) when missing. */
-        fun load(dir: File): Identity {
-            val file = File(dir, "net-key.json")
+        /**
+         * load reads the keys from [store] (by default dir/net-key.json), creating them
+         * (owner-only) when missing.
+         */
+        fun load(dir: File, store: IdentityStore = FileIdentityStore(dir)): Identity {
             var f: MutableMap<String, Any?> = LinkedHashMap()
-            if (file.exists()) {
+            val stored = store.load()
+            if (stored != null) {
                 @Suppress("UNCHECKED_CAST")
-                f = (Json.parse(file.readText()) as? Map<String, Any?>)?.toMutableMap()
+                f = (Json.parse(String(stored)) as? Map<String, Any?>)?.toMutableMap()
                     ?: throw IOException("net-key.json is corrupt")
                 val priv = unb64(f["private"] as? String)
                 val pub = unb64(f["public"] as? String)
@@ -49,13 +52,35 @@ class Identity(val key: KeyPair, val sign: KeyPair) {
                 f["sign"] = b64(randomBytes(32))
                 changed = true
             }
-            if (changed) {
-                dir.mkdirs()
-                writeAtomic(file, Json.write(f).toByteArray())
-            }
+            if (changed) store.save(Json.write(f).toByteArray())
             val key = Crypto.x25519Keypair(unb64(f["private"] as String)!!)
             return Identity(key, Crypto.ed25519Keypair(unb64(f["sign"] as String)!!))
         }
+    }
+}
+
+/**
+ * IdentityStore keeps the serialized identity (the net-key.json document) of a device. The
+ * default [FileIdentityStore] is a plain owner-only file; a platform can plug in its own, for
+ * example one that encrypts the document with a hardware-backed key.
+ */
+interface IdentityStore {
+    /** load returns the saved document, or null when there is none yet. Throws if it cannot be read. */
+    fun load(): ByteArray?
+
+    /** save replaces the saved document; it must not return before the document is durable. */
+    fun save(bytes: ByteArray)
+}
+
+/** FileIdentityStore is dir/net-key.json (owner-only, written atomically). */
+class FileIdentityStore(private val dir: File) : IdentityStore {
+    private val file = File(dir, "net-key.json")
+
+    override fun load(): ByteArray? = if (file.exists()) file.readBytes() else null
+
+    override fun save(bytes: ByteArray) {
+        dir.mkdirs()
+        writeAtomic(file, bytes)
     }
 }
 
