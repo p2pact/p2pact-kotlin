@@ -166,6 +166,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     @Volatile var onEvent: ((peer: String, tool: Int, event: Int, args: List<Any?>) -> Unit)? = null
     /** onPaired is called after pairing (on either side). */
     @Volatile var onPaired: ((Peer) -> Unit)? = null
+    /** onGranted is called when a known device tells what we may use of its tools (event 0.6). */
+    @Volatile var onGranted: ((peer: String, grants: List<Grant>) -> Unit)? = null
     /** onHello is called when a known device sends its hello. */
     @Volatile var onHello: ((String) -> Unit)? = null
     /** onHeld is called when messages from a device waited too long for a dictionary or its list and were dropped. */
@@ -205,6 +207,9 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val peers = HashMap<String, PeerState>()
     private val handlers = HashMap<Pair<Int, Int>, Handler>()
     // named tools: name → number and back, versions
+    // grants: methods that check the level themselves, methods marked read
+    private val levelHandlers = HashMap<Pair<Int, Int>, LevelHandler>()
+    private val readMethods = HashSet<Pair<Int, Int>>()
     private val names = HashMap<String, Int>()
     private val numbers = HashMap<Int, String>()
     private val versions = HashMap<Int, Int>()
@@ -225,6 +230,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         handle(0, 1) { _, _ -> emptyList() } // ping
         handle(0, 2) { peer, _ -> onLoop { info(peer) } }
         handle(0, 5) { peer, args -> dictHandler(peer, args) }
+        handle(0, 6) { peer, _ -> listOf(grantsWire(grants(peer) ?: emptyList())) } // what the caller may use here
     }
 
     // --- the loop ---
@@ -383,6 +389,48 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      * handler that waits long returns [later], so that the stream goes on without it.
      */
     fun handle(tool: Int, method: Int, h: Handler) = onLoop { handlers[tool to method] = h }
+
+    // --- grants (spec §8.1) ---
+
+    /**
+     * handleLevel registers method tool.method like [handle], for a handler that checks the level
+     * itself (see [LevelHandler]).
+     */
+    fun handleLevel(tool: Int, method: Int, h: LevelHandler) = onLoop { levelHandlers[tool to method] = h }
+
+    /** markRead declares methods of a tool as read: a device with read on the tool may call them. The others are write. */
+    fun markRead(tool: Int, vararg methods: Int) = onLoop { for (m in methods) readMethods.add(tool to m) }
+
+    private fun requiredLevel(tool: Int, method: Int): Int =
+        if (levelHandlers.containsKey(tool to method) || readMethods.contains(tool to method)) LEVEL_READ else LEVEL_WRITE
+
+    /** grants is what we let a device use of ours (null — an unknown device). */
+    fun grants(peer: String): List<Grant>? = trust.get(peer)?.allowed()
+
+    /** grantedBy is what a device lets us use of its tools, as it told us (event 0.6); the default if it never did. */
+    fun grantedBy(peer: String): List<Grant>? = trust.get(peer)?.offered()
+
+    /** level is the level a device has on one of our tools, by name. */
+    fun level(peer: String, tool: String): Int = trust.get(peer)?.let { grantLevel(it.grants, tool) } ?: 0
+
+    /**
+     * setGrants replaces what a trusted device may use (an empty list revokes everything), keeps
+     * it with the trust and tells the device with event 0.6.
+     */
+    fun setGrants(peer: String, grants: List<Grant>) {
+        val clean = cleanGrants(grants)
+        require(trust.setGrants(peer, clean)) { "unknown device" }
+        event(peer, 0, 6, grantsWire(clean))
+    }
+
+    /** grant changes one entry: the device gets level on the tool ([LEVEL_READ], [LEVEL_WRITE]); level 0 removes the entry. */
+    fun grant(peer: String, tool: String, level: Int) {
+        val p = trust.get(peer) ?: throw IllegalArgumentException("unknown device")
+        setGrants(peer, p.allowed().filter { it.tool != tool } + (if (level > 0) listOf(Grant(tool, level)) else emptyList()))
+    }
+
+    /** revokeGrants takes everything away from a device but tool 0: it stays trusted and in session. */
+    fun revokeGrants(peer: String) = setGrants(peer, emptyList())
 
     // --- named tools (spec §8) ---
 
@@ -607,6 +655,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val msg = Cbor.encode(listOf<Any?>(3, tool, event) + args.toList())
         onLoop {
             val ps = peerState(peer) ?: throw IllegalArgumentException("unknown device")
+            // a tool's events go only to devices with at least read on it (spec §8.1)
+            if (tool != 0 && grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?: "") < LEVEL_READ) return@onLoop
             push(ps, msg, stream, tool != 0)
         }
     }
@@ -845,6 +895,14 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val ps = peerState(peer) ?: return
         hintsSent = Cbor.encode(hints().toWire()) // what the devices know of us (reannounce)
         push(ps, Cbor.encode(listOf<Any?>(3, 0, 2) + info(peer)), 0, false)
+        grantsEvent(peer, ps)
+    }
+
+    /** grantsEvent tells the device what it may use, unless that is the default it assumes. */
+    private fun grantsEvent(peer: String, ps: PeerState) {
+        val g = trust.get(peer)?.grants ?: return
+        if (isDefaultGrants(g)) return
+        push(ps, Cbor.encode(listOf<Any?>(3, 0, 6, grantsWire(g))), 0, false)
     }
 
     /** message handles a reassembled message (spec §6). */
@@ -859,7 +917,18 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 val tool = a[2].asInt() ?: return
                 val method = a[3].asInt() ?: return
                 if (tool != 0) hear(peer, msg)
-                val h = handlers[tool to method]
+                var h = handlers[tool to method]
+                var level = 0
+                var forbidden = false
+                if (tool != 0) { // grants (spec §8.1): tool 0 is always allowed
+                    level = grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?: "")
+                    forbidden = level < requiredLevel(tool, method)
+                }
+                val lh = levelHandlers[tool to method]
+                if (lh != null && !forbidden) {
+                    val lv = level
+                    h = Handler { p, args -> lh.handle(p, lv, args) }
+                }
                 val args = a.subList(4, a.size)
                 val boot = ps.boot
                 fun reply(res: List<Any?>?, err: Throwable?) {
@@ -881,7 +950,9 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                     }
                 }
                 val run: () -> Unit = {
-                    if (h == null) {
+                    if (forbidden) {
+                        reply(null, P2pactError(Errors.FORBIDDEN, "forbidden"))
+                    } else if (h == null) {
                         reply(null, P2pactError(Errors.NO_METHOD, "no such method"))
                     } else {
                         val res = try { h.handle(peer, args) } catch (e: Exception) { reply(null, e); null }
@@ -918,6 +989,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                     fetchNew(peer, ps)
                     drain(peer, ps)
                     onHello?.let { cb -> callbacks.execute { cb(peer) } }
+                    return
+                }
+                if (tool == 0 && ev == 6 && a.size >= 4) { // what we may use of its tools
+                    parseGrants(a[3])?.let { g ->
+                        trust.setGranted(peer, g)
+                        onGranted?.let { cb -> callbacks.execute { cb(peer, g) } }
+                    }
                     return
                 }
                 if (tool == 0 && ev == 5 && a.size >= 4) { // the dictionary list changed

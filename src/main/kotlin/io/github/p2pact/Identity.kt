@@ -115,6 +115,13 @@ data class Peer(
     val os: String? = null,
     val via: String? = null, // joined through our invite with this id (hex)
     val kind: Int = Kind.UNKNOWN, // what the device is for (spec §1); 0 — not said
+    /**
+     * What we let this device use of ours (spec §8.1); null — never set, which is ["*", 2]: a
+     * person's own device uses everything. An empty list grants nothing.
+     */
+    val grants: List<Grant>? = null,
+    /** What the device lets us use of its tools (its event 0.6); null — not told, which is ["*", 2] as well. */
+    val granted: List<Grant>? = null,
 ) {
     /** relayChannel is the pair's relay channel: only these two devices know it (spec §3). */
     val relayChannel: String get() = Crypto.mac(pairSecret, "relay").copyOf(16).hex()
@@ -156,6 +163,7 @@ class Trust(dir: File) {
                         pairSecret = unb64(m["pair_secret"] as? String) ?: ByteArray(0), hints = Hints.fromJson(m["hints"]),
                         added = (m["added"] as? Number)?.toLong() ?: 0, signKey = unb64(m["sign_key"] as? String),
                         os = m["os"] as? String, via = m["via"] as? String, kind = (m["kind"] as? Number)?.toInt() ?: 0,
+                        grants = grantsFromJson(m["grants"]), granted = grantsFromJson(m["granted"]),
                     )
                     if (p.key.size == 32 && Crypto.address(p.key) == p.addr) peers[p.addr] = p
                 }
@@ -175,6 +183,23 @@ class Trust(dir: File) {
     @Synchronized
     fun put(p: Peer) {
         peers[p.addr] = if (p.added == 0L) p.copy(added = System.currentTimeMillis()) else p
+        save()
+    }
+
+    /** setGrants stores what we let a known device use; false — no such device. */
+    @Synchronized
+    fun setGrants(addr: String, g: List<Grant>): Boolean {
+        val p = peers[addr] ?: return false
+        peers[addr] = p.copy(grants = g.toList())
+        save()
+        return true
+    }
+
+    /** setGranted stores what a known device told us we may use of its tools. */
+    @Synchronized
+    fun setGranted(addr: String, g: List<Grant>) {
+        val p = peers[addr] ?: return
+        peers[addr] = p.copy(granted = g.toList())
         save()
     }
 
@@ -217,6 +242,8 @@ class Trust(dir: File) {
                 p.os?.let { put("os", it) }
                 p.via?.let { put("via", it) }
                 if (p.kind != Kind.UNKNOWN) put("kind", p.kind)
+                put("grants", p.grants?.let { grantsToJson(it) }) // null: never set, the default
+                p.granted?.let { put("granted", grantsToJson(it)) }
             }
         }
         val b = Json.write(list, "  ").toByteArray()
