@@ -19,12 +19,18 @@
 //     link: writes of at most mtu bytes, paced to rate bytes a second (0 — not paced); the
 //     listening side attaches the first connection it accepts; peer optional (bound road)
 //   {"cmd":"close"}
+// Kinds, named tools, grants, wants, the local socket and hosted tools: "kind", "peer-info", "tool",
+// "call-tool", "grant", "set-grants", "grants", "emit", "events", "on-wants", "local", "plugin-env", "proxy" and
+// join with "wants" (see p2pact-go/cmd/p2pact-interop for their JSON).
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
 package io.github.p2pact.interop
 
 import io.github.p2pact.AppRoad
 import io.github.p2pact.AppRoadConfig
 import io.github.p2pact.Errors
+import io.github.p2pact.Grant
+import io.github.p2pact.Handler
+import io.github.p2pact.LEVEL_WRITE
 import io.github.p2pact.Invite
 import io.github.p2pact.Json
 import io.github.p2pact.Node
@@ -66,6 +72,12 @@ fun main(argv: Array<String>) {
             .exceptionally { throw P2pactError(Errors.FAILED, "no call came behind") }
             .thenApply { listOf(b) })
     }
+    val ownTools = HashMap<String, Int>()
+    val events = ArrayList<Map<String, Any?>>()
+    node.onEvent = { peer, tool, ev, args ->
+        val d = (args.getOrNull(0) as? ByteArray)?.let { Base64.getEncoder().encodeToString(it) } ?: ""
+        synchronized(events) { events.add(mapOf("peer" to peer, "tool" to (node.peerToolName(peer, tool) ?: ""), "event" to ev, "data" to d)) }
+    }
     node.start()
     val out = System.out
     fun say(v: Map<String, Any?>) {
@@ -89,7 +101,10 @@ fun main(argv: Array<String>) {
                     say(mapOf("addr" to node.id.addr, "udp" to (node.udpRoad?.localAddr ?: ""), "tcp" to (node.tcpRoad?.localAddr ?: "")))
                 }
                 "invite" -> say(mapOf("invite" to node.invite(600_000).toString()))
-                "join" -> say(mapOf("peer" to node.join(Invite.parse(req["invite"] as String), 15_000).addr))
+                "join" -> {
+                    val wants = if (req["wants"] != null) grantsIn(req["wants"]) else null
+                    say(mapOf("peer" to node.join(Invite.parse(req["invite"] as String), 15_000, wants).addr))
+                }
                 "known" -> say(mapOf("known" to (node.trust.get(req["peer"] as String) != null)))
                 "call" -> {
                     val data = dec.decode(req["data"] as? String ?: "")
@@ -143,6 +158,82 @@ fun main(argv: Array<String>) {
                         say(mapOf("ok" to true))
                     }
                 }
+                "kind" -> {
+                    node.kind = (req["kind"] as Number).toInt()
+                    say(mapOf("ok" to true))
+                }
+                "peer-info" -> {
+                    val peer = req["peer"] as String
+                    val num = (req["tool"] as? String)?.let { node.toolNumber(peer, it) }
+                    say(mapOf("kind" to (node.trust.get(peer)?.kind ?: 0), "tools" to node.peerTools(peer), "number" to num))
+                }
+                "tool" -> {
+                    val name = req["name"] as String
+                    val num = node.registerTool(name, 1)
+                    ownTools[name] = num
+                    val echoTool = Handler { _, args -> listOf(args.getOrNull(0)) }
+                    node.handleTool(name, 1, echoTool)
+                    node.handleTool(name, 2, echoTool)
+                    node.handleTool(name, 3) { _, _ -> listOf(name.toByteArray()) }
+                    node.markRead(num, 1, 3)
+                    say(mapOf("number" to num))
+                }
+                "call-tool" -> {
+                    val data = dec.decode(req["data"] as? String ?: "")
+                    val stream = (req["stream"] as? Number)?.toLong() ?: 0
+                    try {
+                        val res = node.callToolOn(req["peer"] as String, stream, req["name"] as String, (req["method"] as Number).toInt(), data, timeoutMs = 60_000).get()
+                        val b = res.getOrNull(0) as? ByteArray ?: throw IllegalStateException("invalid result")
+                        say(mapOf("data" to enc.encodeToString(b)))
+                    } catch (e: ExecutionException) {
+                        val c = e.cause
+                        say(mapOf("error" to (c?.message ?: c.toString()), "code" to (c as? P2pactError)?.code))
+                    }
+                }
+                "grant" -> {
+                    node.grant(req["peer"] as String, req["tool"] as String, (req["level"] as Number).toInt())
+                    say(mapOf("ok" to true))
+                }
+                "set-grants" -> {
+                    node.setGrants(req["peer"] as String, grantsIn(req["grants"]))
+                    say(mapOf("ok" to true))
+                }
+                "grants" -> {
+                    val peer = req["peer"] as String
+                    fun out(g: List<Grant>?) = (g ?: emptyList()).map { listOf(it.tool, it.level) }
+                    say(mapOf("allowed" to out(node.grants(peer)), "granted" to out(node.grantedBy(peer))))
+                }
+                "emit" -> {
+                    node.event(req["peer"] as String, ownTools[req["name"] as String]!!, (req["event"] as Number).toInt(), dec.decode(req["data"] as String))
+                    say(mapOf("ok" to true))
+                }
+                "events" -> say(mapOf("events" to synchronized(events) { ArrayList(events) }))
+                "on-wants" -> {
+                    val cap = (req["level"] as Number).toInt()
+                    node.onWants = { _, wants -> wants.map { Grant(it.tool, minOf(it.level, cap)) } }
+                    say(mapOf("ok" to true))
+                }
+                "local" -> {
+                    (req["listen"] as? String)?.let { node.listenLocal(it) } ?: node.useLocal(req["use"] as String)
+                    say(mapOf("ok" to true))
+                }
+                "plugin-env" -> {
+                    val env = node.pluginEnv(600_000, grantsIn(req["grants"])).associate { it.substringBefore('=') to it.substringAfter('=') }
+                    say(mapOf("socket" to env["P2PACT_SOCKET"], "invite" to env["P2PACT_INVITE"]))
+                }
+                "proxy" -> {
+                    val name = req["name"] as String
+                    val plugin = req["plugin"] as String
+                    node.handleToolAll(name) { _, level, method, args ->
+                        if (method == 2 && level < LEVEL_WRITE) throw P2pactError(Errors.FORBIDDEN, "forbidden")
+                        try {
+                            node.callTool(plugin, name, method, *args.toTypedArray(), timeoutMs = 20_000).get()
+                        } catch (e: ExecutionException) {
+                            throw e.cause ?: e
+                        }
+                    }
+                    say(mapOf("ok" to true))
+                }
                 "close" -> {
                     node.close()
                     exitProcess(0)
@@ -157,6 +248,10 @@ fun main(argv: Array<String>) {
     node.close()
     exitProcess(0)
 }
+
+/** grantsIn reads [["tool", N]…]. */
+private fun grantsIn(v: Any?): List<Grant> =
+    (v as? List<*> ?: emptyList<Any?>()).mapNotNull { e -> (e as? List<*>)?.let { Grant(it[0] as String, (it[1] as Number).toInt()) } }
 
 /** PipeLink is a Bluetooth LE link stood in for by a TCP connection: send writes at most the MTU at a time, at the link's rate. */
 private class PipeLink(val socket: Socket, val rate: Int) : AppRoad {

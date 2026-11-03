@@ -223,6 +223,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     // grants: methods that check the level themselves, methods marked read
     private val levelHandlers = HashMap<Pair<Int, Int>, LevelHandler>()
     private val readMethods = HashSet<Pair<Int, Int>>()
+    private val toolHandlers = HashMap<Int, ToolHandler>() // one handler for all methods of a tool (handleToolAll)
     private val names = HashMap<String, Int>()
     private val numbers = HashMap<Int, String>()
     private val versions = HashMap<Int, Int>()
@@ -474,7 +475,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     fun markRead(tool: Int, vararg methods: Int) = onLoop { for (m in methods) readMethods.add(tool to m) }
 
     private fun requiredLevel(tool: Int, method: Int): Int =
-        if (levelHandlers.containsKey(tool to method) || readMethods.contains(tool to method)) LEVEL_READ else LEVEL_WRITE
+        if (levelHandlers.containsKey(tool to method) || readMethods.contains(tool to method) ||
+            (toolHandlers.containsKey(tool) && !handlers.containsKey(tool to method))) LEVEL_READ else LEVEL_WRITE
 
     /** grants is what we let a device use of ours (null — an unknown device). */
     fun grants(peer: String): List<Grant>? = trust.get(peer)?.allowed()
@@ -542,6 +544,35 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val num = FIXED_TOOLS[name] ?: registerTool(name, 1)
         handle(num, method, h)
     }
+
+    /**
+     * handleToolAll serves every method of the named tool with h (the tool is registered at version 1
+     * if it is not yet). The node only requires read on the tool; what each method needs is for h
+     * to check. Methods registered one by one with [handle] keep their own handlers. For a device
+     * that hosts another program's tool (spec §8.2).
+     */
+    fun handleToolAll(name: String, h: ToolHandler) {
+        val num = registerTool(name, 1)
+        onLoop { toolHandlers[num] = h }
+    }
+
+    /**
+     * unregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
+     * session) and its handlers are dropped. Registering the name again may give another number.
+     */
+    fun unregisterTool(name: String) = onLoop {
+        val num = names.remove(name) ?: return@onLoop
+        numbers.remove(num)
+        versions.remove(num)
+        toolHandlers.remove(num)
+        handlers.keys.removeAll { it.first == num }
+        levelHandlers.keys.removeAll { it.first == num }
+        readMethods.removeAll { it.first == num }
+        reannounceTools()
+    }
+
+    /** peerTools lists the named tools a device announced in its hello, sorted by name. */
+    fun peerTools(peer: String): List<String> = onLoop { peers[peer]?.named?.keys?.sorted() ?: emptyList() }
 
     /** toolName is the name of a tool of ours by its number (null — it has none: a number of the implementation's own). */
     fun toolName(tool: Int): String? = onLoop { toolNameOf(tool) }
@@ -785,6 +816,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val tools = LinkedHashMap<Any?, Any?>()
         // tools whose handlers check the caller's level are tools too
         for (k in handlers.keys + levelHandlers.keys) if (k.first != 0 && !numbers.containsKey(k.first)) tools[k.first] = 1
+        for (t in toolHandlers.keys) if (t != 0 && !numbers.containsKey(t)) tools[t] = 1
         return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind, namedTools())
     }
 
@@ -1067,9 +1099,14 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                     forbidden = level < requiredLevel(tool, method)
                 }
                 val lh = levelHandlers[tool to method]
+                val th = toolHandlers[tool]
                 if (lh != null && !forbidden) {
                     val lv = level
                     h = Handler { p, args -> lh.handle(p, lv, args) }
+                }
+                if (h == null && th != null && !forbidden) {
+                    val lv = level
+                    h = Handler { p, args -> th.handle(p, lv, method, args) }
                 }
                 val args = a.subList(4, a.size)
                 val boot = ps.boot

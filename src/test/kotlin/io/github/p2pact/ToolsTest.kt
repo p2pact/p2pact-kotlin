@@ -67,4 +67,25 @@ class ToolsTest : NetTestBase() {
         assertFalse(a.trust.get(b.id.addr) == null)
         echo(a, b, "numbered".toByteArray())
     }
+
+    // One handler for every method of a named tool (a device hosting another program's tool): it gets
+    // the method and the caller's level; the hello announces the tool; unregisterTool takes it back.
+    @Test
+    fun toolWideHandler() {
+        val host = node("Host")
+        val client = node("Client")
+        host.handleToolAll("com.acme.hosted") { _, level, method, args ->
+            if (method == 2 && level < LEVEL_WRITE) throw P2pactError(Errors.FORBIDDEN, "forbidden")
+            listOf("m$method:l$level:" + args[0])
+        }
+        pair(host, client)
+        eventually("hello") { client.peerTools(host.id.addr).contains("com.acme.hosted") }
+        host.setGrants(client.id.addr, listOf(Grant("com.acme.hosted", LEVEL_READ)))
+        assertEquals(listOf<Any?>("m7:l1:x"), client.callTool(host.id.addr, "com.acme.hosted", 7, "x", timeoutMs = 10_000).get())
+        assertEquals(Errors.FORBIDDEN, code(client.callTool(host.id.addr, "com.acme.hosted", 2, "x", timeoutMs = 10_000)))
+        host.setGrants(client.id.addr, listOf(Grant("com.acme.hosted", LEVEL_WRITE)))
+        assertEquals(listOf<Any?>("m2:l2:x"), client.callTool(host.id.addr, "com.acme.hosted", 2, "x", timeoutMs = 10_000).get())
+        host.unregisterTool("com.acme.hosted")
+        eventually("tool gone") { client.peerTools(host.id.addr).isEmpty() }
+    }
 }

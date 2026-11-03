@@ -79,3 +79,11 @@ internal fun grantsFromJson(v: Any?): List<Grant>? {
 fun interface LevelHandler {
     fun handle(peer: String, level: Int, args: List<Any?>): List<Any?>
 }
+
+/**
+ * ToolHandler is one handler for every method of a tool (see [Node.handleToolAll]): it gets the
+ * method number and the caller's level (1 or 2), and checks the level itself.
+ */
+fun interface ToolHandler {
+    fun handle(peer: String, level: Int, method: Int, args: List<Any?>): List<Any?>
+}
