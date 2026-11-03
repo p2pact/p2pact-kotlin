@@ -83,6 +83,7 @@ private class PendingHs(
     val invite: Invite? = null, // pairing: their invite (we join) or ours (they join)
     val done: CompletableFuture<Peer>? = null,
     val remoteIdx: Long = 0, // pairing, we respond: the joiner's index
+    val wants: List<Grant>? = null, // pairing, we join: what we ask to use on the inviting device (spec §2)
 ) {
     // data that overtook the handshake reply (reordering): run once the session is up
     val early = ArrayList<Pair<ByteArray, Endpoint>>()
@@ -166,6 +167,14 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     @Volatile var onEvent: ((peer: String, tool: Int, event: Int, args: List<Any?>) -> Unit)? = null
     /** onPaired is called after pairing (on either side). */
     @Volatile var onPaired: ((Peer) -> Unit)? = null
+    /**
+     * onWants is called on the inviting device when a newcomer has paired (spec §2), with what it
+     * asks to use (everything, if it did not say): the application shows it to its person and
+     * returns what the newcomer is granted, or null to refuse (the newcomer is forgotten). It runs
+     * on a worker thread and may wait for the person; the newcomer can use nothing meanwhile.
+     * [onPaired] follows when it accepts. null — the newcomer gets what it asked for.
+     */
+    @Volatile var onWants: ((p: Peer, wants: List<Grant>) -> List<Grant>?)? = null
     /** onGranted is called when a known device tells what we may use of its tools (event 0.6). */
     @Volatile var onGranted: ((peer: String, grants: List<Grant>) -> Unit)? = null
     /** onHello is called when a known device sends its hello. */
@@ -520,7 +529,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     }
 
     /** join pairs using an invite, trying all its hints until one answers. */
-    fun joinAsync(inv: Invite, timeoutMs: Long = 30_000): CompletableFuture<Peer> {
+    fun joinAsync(inv: Invite, timeoutMs: Long = 30_000, wants: List<Grant>? = null): CompletableFuture<Peer> {
         val done = CompletableFuture<Peer>()
         post {
             val eps = ArrayList<Endpoint>()
@@ -550,7 +559,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 val h = Handshake(Pattern.XXpsk2, true, PROLOGUE.toByteArray(), id.key, psk = inv.secret)
                 val msg1 = h.writeMessage()
                 local = newIndex()
-                hs[local] = PendingHs(true, h, Clock.nanos(), invite = inv, done = done)
+                hs[local] = PendingHs(true, h, Clock.nanos(), invite = inv, done = done, wants = wants)
                 val pkt = cat(byteArrayOf(P_PAIR1.toByte()), inv.id, be32(local), msg1)
                 if (!paused) { // paused: try again on the next round
                     r?.join(inv.id.hex(), "b") // again after a pause closed it
@@ -565,11 +574,18 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     }
 
     /** join pairs using an invite and waits for it. */
-    fun join(inv: Invite, timeoutMs: Long = 30_000): Peer = try {
-        joinAsync(inv, timeoutMs).get()
+    fun join(inv: Invite, timeoutMs: Long = 30_000, wants: List<Grant>? = null): Peer = try {
+        joinAsync(inv, timeoutMs, wants).get()
     } catch (e: java.util.concurrent.ExecutionException) {
         throw e.cause ?: e
     }
+
+    /**
+     * joinWants is [join] asking for permissions (spec §2, `wants`): what we want to use on the
+     * inviting device. Its person may narrow it; the result comes back as event 0.6 ([grantedBy],
+     * [onGranted]). null in [join] — we ask for everything, as between one person's own devices.
+     */
+    fun joinWants(inv: Invite, wants: List<Grant>, timeoutMs: Long = 30_000): Peer = join(inv, timeoutMs, wants)
 
     /**
      * PairInfo is the pairing handshake payload [name, boot, hints, signing key, os, kind]: the
@@ -578,18 +594,24 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      */
     internal class PairInfo(
         val name: String, val boot: Long, val hints: Hints, val signKey: ByteArray?, val os: String?, val kind: Int,
+        val wants: List<Grant>?, // what the newcomer asks to use (spec §2); null — it did not say, which is everything
     )
 
     internal fun parsePair(payload: ByteArray): PairInfo {
         val a = try { Cbor.decode(payload).asList() } catch (e: Exception) { null } ?: emptyList()
         return PairInfo(a.getOrNull(0).asString() ?: "", a.getOrNull(1).asLong() ?: 0, Hints.fromWire(a.getOrNull(2)),
-            a.getOrNull(3).asBytes(), a.getOrNull(4).asString(), a.getOrNull(5).asInt() ?: Kind.UNKNOWN)
+            a.getOrNull(3).asBytes(), a.getOrNull(4).asString(), a.getOrNull(5).asInt() ?: Kind.UNKNOWN,
+            if (a.size > 6) parseGrants(a[6]) else null)
     }
 
-    /** pairPayload is our payload; with no kind said the field is left out: an older device gets what it knows. */
-    internal fun pairPayload(): ByteArray {
+    /**
+     * pairPayload is our payload; wants are what we ask to use (null — not asking, the field is
+     * left out, and so is the kind if we do not say one: an older device gets what it knows).
+     */
+    internal fun pairPayload(wants: List<Grant>? = null): ByteArray {
         val a = arrayListOf<Any?>(name, boot, hints().toWire(), id.sign.public, goos())
-        if (kind != Kind.UNKNOWN) a.add(kind)
+        if (kind != Kind.UNKNOWN || wants != null) a.add(kind)
+        if (wants != null) a.add(grantsWire(cleanGrants(wants)))
         return Cbor.encode(a)
     }
 
@@ -832,7 +854,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             return
         }
         val pp = parsePair(payload)
-        val msg3 = h.hs.writeMessage(pairPayload())
+        val msg3 = h.hs.writeMessage(pairPayload(h.wants))
         val (c1, c2) = h.hs.ciphers ?: return
         hs.remove(local)
         val peer = Crypto.address(inv.key)
@@ -867,7 +889,13 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val key = h.hs.rs!!.copyOf()
         val peer = Crypto.address(key)
         val pp = parsePair(payload)
-        val p = Peer(peer, key, pp.name, inv.secret, pp.hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, via = inv.id.hex())
+        var p = Peer(peer, key, pp.name, inv.secret, pp.hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, via = inv.id.hex())
+        // what the newcomer may use (spec §2): without wants it asks for everything and keeps the
+        // default; with them, and no onWants to narrow them, it gets what it asked. With onWants
+        // the application decides: until it does the newcomer may use nothing.
+        pp.wants?.let { p = p.copy(grants = cleanGrants(it)) }
+        val decide = onWants
+        if (decide != null) p = p.copy(grants = emptyList())
         trust.put(p)
         // the joiner was the initiator; we are the responder
         val s = Session(peer, local, h.remoteIdx, c2, c1, now)
@@ -876,6 +904,23 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
         bootOf(ps, pp.boot)
+        if (decide != null) {
+            val wants = cleanGrants(pp.wants ?: defaultGrants())
+            val newcomer = trust.get(peer) ?: p
+            sendInfo(peer)
+            execute {
+                val grants = try { decide(newcomer, wants) } catch (e: Exception) { null }
+                if (grants == null) { // refused: the newcomer is forgotten
+                    forget(peer)
+                } else {
+                    try { setGrants(peer, grants) } catch (e: IllegalArgumentException) { return@execute }
+                    val cb = onPaired
+                    val now2 = trust.get(peer)
+                    if (cb != null && now2 != null) callbacks.execute { cb(now2) }
+                }
+            }
+            return
+        }
         paired(trust.get(peer) ?: p)
     }
 
