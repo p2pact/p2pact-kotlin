@@ -113,6 +113,7 @@ private class PeerState(val addr: String) {
     var askingInfo = false // our 0.2 info call is on its way (askInfo)
     var askedInfo = 0L
     var fetching = false
+    var named: Map<String, ToolRef> = emptyMap() // its named tools, from its hello (spec §8)
     var tried = ArrayList<ByteArray>() // dictionaries of its list we asked it for and did not get
     val sysCalls = HashSet<Long>() // our calls of tool 0: their results are not conversation
     val inbox = HashMap<Long, Inbox>() // calls and events waiting for their turn, per stream
@@ -203,6 +204,10 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     private val invites = HashMap<String, Invite>() // our invites by id (hex)
     private val peers = HashMap<String, PeerState>()
     private val handlers = HashMap<Pair<Int, Int>, Handler>()
+    // named tools: name → number and back, versions
+    private val names = HashMap<String, Int>()
+    private val numbers = HashMap<Int, String>()
+    private val versions = HashMap<Int, Int>()
     private val resetAt = HashMap<String, Long>()
     private val dicts = DictStore(dir, io)
     private val learner = Learner(dir, dicts, timing, io, trainer, ::post) { d -> addDictLocal(d) }
@@ -379,6 +384,83 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
      */
     fun handle(tool: Int, method: Int, h: Handler) = onLoop { handlers[tool to method] = h }
 
+    // --- named tools (spec §8) ---
+
+    /**
+     * registerTool gives a tool of ours a name and picks its number: the first one from 64 up that
+     * no other tool of ours uses. The same name gets the same number for the rest of the run. The
+     * number is announced in the hello's named map, and the devices in session get the new hello
+     * at once. Other devices may number the same name differently: callers use [toolNumber].
+     */
+    fun registerTool(name: String, version: Int = 1): Int {
+        require(validToolName(name)) { "bad tool name: $name" }
+        return onLoop {
+            val known = names[name]
+            if (known != null) {
+                if (versions[known] != version) {
+                    versions[known] = version
+                    reannounceTools()
+                }
+                return@onLoop known
+            }
+            var num = FIRST_NAMED_TOOL
+            while (numbers.containsKey(num) || handlers.keys.any { it.first == num }) num++
+            names[name] = num
+            numbers[num] = name
+            versions[num] = version
+            reannounceTools()
+            num
+        }
+    }
+
+    private fun reannounceTools() {
+        for (peer in current.keys.toList()) sendInfo(peer)
+    }
+
+    /** handleTool registers method of the named tool (registered at version 1 if it is not yet): [handle] by name. */
+    fun handleTool(name: String, method: Int, h: Handler) {
+        val num = FIXED_TOOLS[name] ?: registerTool(name, 1)
+        handle(num, method, h)
+    }
+
+    /** toolName is the name of a tool of ours by its number (null — it has none: a number of the implementation's own). */
+    fun toolName(tool: Int): String? = onLoop { toolNameOf(tool) }
+
+    private fun toolNameOf(tool: Int): String? = FIXED_TOOLS.entries.firstOrNull { it.value == tool }?.key ?: numbers[tool]
+
+    /**
+     * toolNumber resolves a tool name to the number the device announced for it in its hello (spec
+     * §8); the tools of the spec have their fixed numbers. null — the device has not announced it
+     * (or we have not heard its hello yet).
+     */
+    fun toolNumber(peer: String, name: String): Int? {
+        FIXED_TOOLS[name]?.let { return it }
+        return onLoop { peers[peer]?.named?.get(name)?.number }
+    }
+
+    /** peerToolName is the name of a tool of a device by the number it announced: what an onEvent handler needs (null — unnamed). */
+    fun peerToolName(peer: String, tool: Int): String? {
+        FIXED_TOOLS.entries.firstOrNull { it.value == tool }?.let { return it.key }
+        return onLoop { peers[peer]?.named?.entries?.firstOrNull { it.value.number == tool }?.key }
+    }
+
+    /** callTool is [call] by tool name: the number is the device's own. */
+    fun callTool(peer: String, name: String, method: Int, vararg args: Any?, timeoutMs: Long = 0): CompletableFuture<List<Any?>> =
+        callToolOn(peer, 0, name, method, *args, timeoutMs = timeoutMs)
+
+    /** callToolOn is [callOn] by tool name. */
+    fun callToolOn(peer: String, stream: Long, name: String, method: Int, vararg args: Any?, timeoutMs: Long = 0): CompletableFuture<List<Any?>> {
+        val num = toolNumber(peer, name)
+            ?: return CompletableFuture<List<Any?>>().also {
+                it.completeExceptionally(P2pactError(Errors.NO_METHOD, "the device has no tool $name"))
+            }
+        return callOn(peer, stream, num, method, *args, timeoutMs = timeoutMs)
+    }
+
+    /** namedTools is the hello's named map: {name: [tool, version]}. */
+    private fun namedTools(): Map<String, List<Int>> =
+        names.entries.associate { (name, num) -> name to listOf(num, versions[num] ?: 1) }
+
     // --- pairing ---
 
     /** invite creates an invite valid for ttlMs; pairing is accepted on all our roads. */
@@ -545,8 +627,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     /** info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind]. */
     private fun info(peer: String): List<Any?> {
         val tools = LinkedHashMap<Any?, Any?>()
-        for (k in handlers.keys) if (k.first != 0) tools[k.first] = 1
-        return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind)
+        for (k in handlers.keys) if (k.first != 0 && !numbers.containsKey(k.first)) tools[k.first] = 1
+        return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind, namedTools())
     }
 
     private fun hints(): Hints {
@@ -829,6 +911,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 if (tool == 0 && ev == 2 && a.size >= 9) { // hello: name, hints, dictionaries
                     trust.setHints(peer, a[3].asString() ?: "", a[4].asString() ?: "", Hints.fromWire(a[8]))
                     if (a.size >= 10) a[9].asInt()?.let { trust.setKind(peer, it) }
+                    ps.named = if (a.size >= 11) parseNamed(a[10]) else emptyMap()
                     ps.dicts = idsOf(a[7])
                     ps.lacks = ArrayList()
                     ps.tried = ArrayList()
@@ -851,6 +934,18 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 enqueue(ps, stream) { cb(peer, tool, ev, args) }
             }
         }
+    }
+
+    /** parseNamed reads the hello's {name: [tool, version]}; a malformed entry is skipped. */
+    private fun parseNamed(v: Any?): Map<String, ToolRef> {
+        val m = v as? Map<*, *> ?: return emptyMap()
+        val out = HashMap<String, ToolRef>()
+        for ((k, e) in m) {
+            val l = e.asList() ?: continue
+            val name = k as? String ?: continue
+            out[name] = ToolRef(l.getOrNull(0).asInt() ?: continue, l.getOrNull(1).asInt() ?: continue)
+        }
+        return out
     }
 
     private fun execute(f: () -> Unit) {
