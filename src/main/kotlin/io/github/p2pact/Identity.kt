@@ -120,7 +120,7 @@ data class Peer(
      * person's own device uses everything. An empty list grants nothing.
      */
     val grants: List<Grant>? = null,
-    /** What the device lets us use of its tools (its event 0.6); null — not told, which is ["*", 2] as well. */
+    /** What the device lets us use of its tools (its event 0.6); null — not told, which is ["*", 2] as well; joined with wants: an empty list until the first 0.6. */
     val granted: List<Grant>? = null,
     /** We reach the device over our local socket (a plugin's host, spec §3). */
     val local: Boolean = false,

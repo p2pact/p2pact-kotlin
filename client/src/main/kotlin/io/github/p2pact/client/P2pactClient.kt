@@ -244,7 +244,10 @@ class Computer internal constructor(internal val owner: P2pactClient, val id: St
     /** The roads in use: `udp`, `tcp`, `relay:<address>`… */
     val paths: List<String> get() = node.paths(id)
 
-    /** What the computer lets us use of its tools, as it told us (event 0.6); everything until it says. */
+    /**
+     * What the computer lets us use of its tools, as it told us (event 0.6). Paired with wants (the SDK always
+     * asks): nothing until the first 0.6 arrives. A device that joined without wants has everything until told.
+     */
     val grants: List<Grant> get() = node.grantedBy(id) ?: listOf(Grant(ALL_TOOLS, LEVEL_WRITE))
 
     /** The level we have on a tool of the computer: 0 none, 1 [LEVEL_READ], 2 [LEVEL_WRITE]. */

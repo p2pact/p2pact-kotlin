@@ -81,4 +81,34 @@ class WantsTest : NetTestBase() {
         assertEquals(defaultGrants(), got.poll(3, TimeUnit.SECONDS))
         eventually("forgotten") { a.trust.get(b.id.addr) == null }
     }
+
+    // A newcomer that asked and is not yet answered may use nothing (kept over a restart); one that did not ask has everything.
+    
+    fun nothingUntilTold() {
+        val dir = tmp.newFolder()
+        val a = node("Mac")
+        val b = node("App", dir = dir)
+        val release = CountDownLatch(1)
+        a.onWants = { _, _ -> release.await(); listOf(Grant("com.acme.x", LEVEL_READ)) }
+        b.kind = Kind.CLIENT
+        joinWants(a, b, listOf(Grant("com.acme.x", LEVEL_WRITE)))
+        assertEquals(emptyList<Grant>(), b.grantedBy(a.id.addr))
+        assertEquals(emptyList<Grant>(), Trust(dir).get(a.id.addr)!!.granted)
+        release.countDown()
+        eventually("told") { b.grantedBy(a.id.addr) == listOf(Grant("com.acme.x", LEVEL_READ)) }
+        val c = node("Phone")
+        a.onWants = null
+        joinWants(a, c, null)
+        assertEquals(defaultGrants(), c.grantedBy(a.id.addr))
+    }
+
+    // Asked for everything and got it: still told by 0.6, or the newcomer would wait for ever.
+    
+    fun everythingIsTold() {
+        val a = node("Mac")
+        val b = node("App")
+        b.kind = Kind.CLIENT
+        joinWants(a, b, listOf(Grant(ALL_TOOLS, LEVEL_WRITE)))
+        eventually("told everything") { b.grantedBy(a.id.addr) == defaultGrants() && b.trust.get(a.id.addr)!!.granted != null }
+    }
 }

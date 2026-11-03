@@ -681,7 +681,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     /**
      * joinWants is [join] asking for permissions (spec §2, `wants`): what we want to use on the
      * inviting device. Its person may narrow it; the result comes back as event 0.6 ([grantedBy],
-     * [onGranted]). null in [join] — we ask for everything, as between one person's own devices.
+     * [onGranted]). Until the first 0.6 the device grants us nothing.
+     * null in [join] — we ask for everything, as between one person's own devices (everything until told).
      */
     fun joinWants(inv: Invite, wants: List<Grant>, timeoutMs: Long = 30_000): Peer = join(inv, timeoutMs, wants)
 
@@ -980,7 +981,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         val hints = Hints(
             udp = wh.udp.ifEmpty { inv.hints.udp }, tcp = wh.tcp.ifEmpty { inv.hints.tcp }, relay = wh.relay ?: inv.hints.relay,
         )
-        val p = Peer(peer, inv.key, pp.name, inv.secret, hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, local = isLocal(from))
+        val p = Peer(peer, inv.key, pp.name, inv.secret, hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, local = isLocal(from),
+            granted = if (h.wants != null) emptyList() else null) // asked: nothing until the first 0.6 (spec §2)
         trust.put(p)
         val s = Session(peer, local, u32(pkt, 5), c1, c2, now)
         sessions[local] = s
@@ -1072,10 +1074,12 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         grantsEvent(peer, ps)
     }
 
-    /** grantsEvent tells the device what it may use, unless that is the default it assumes. */
+    /**
+     * grantsEvent tells the device what it may use, unless we never set it (the default it assumes).
+     * A newcomer that asked has an explicit set, even ["*", 2]: it waits for this event (spec §2).
+     */
     private fun grantsEvent(peer: String, ps: PeerState) {
         val g = trust.get(peer)?.grants ?: return
-        if (isDefaultGrants(g)) return
         push(ps, Cbor.encode(listOf<Any?>(3, 0, 6, grantsWire(g))), 0, false)
     }
 

@@ -24,8 +24,6 @@ fun grantLevel(grants: List<Grant>?, tool: String): Int {
     return level
 }
 
-internal fun isDefaultGrants(g: List<Grant>?) = g == null || (g.size == 1 && g[0] == Grant(ALL_TOOLS, LEVEL_WRITE))
-
 /** allowed is what we let the device use of ours (spec §8.1); the default if never set. */
 fun Peer.allowed(): List<Grant> = grants?.toList() ?: defaultGrants()
 
