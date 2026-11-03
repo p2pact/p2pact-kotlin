@@ -81,7 +81,7 @@ class FakeEngine(dir: File) : AutoCloseable {
         val resp = overrides["$tool:$method"]?.invoke(params) ?: when (tool) {
             1 -> chat(method, params)
             2 -> fleet(method, params)
-            else -> plugins(method)
+            else -> plugins(method, params)
         }
         return listOf(wire(resp))
     }
@@ -118,8 +118,9 @@ class FakeEngine(dir: File) : AutoCloseable {
         else mapOf("jsonrpc" to "2.0", "result" to mapOf("ok" to true))
     }
 
-    private fun plugins(method: String): JsonMap {
+    private fun plugins(method: String, params: JsonMap): JsonMap {
         val stem = method.replace('/', '.')
+        if (method == "plugins/log" && params.str("name") == "com.example.nope") return Fixtures.read("p2pact.plugins", "plugins.log.unknown.response")
         return if (Fixtures.exists("p2pact.plugins", "$stem.response")) Fixtures.read("p2pact.plugins", "$stem.response")
         else mapOf("jsonrpc" to "2.0", "error" to mapOf("code" to -32601, "message" to "no method $method"))
     }
@@ -145,6 +146,6 @@ class FakeEngine(dir: File) : AutoCloseable {
         val CHAT_READ = setOf("initialize", "session/list", "session/load", "_p2pact/older", "_p2pact/commands", "_p2pact/files",
             "_p2pact/history", "_p2pact/projects", "_p2pact/agents", "_p2pact/image", "_p2pact/diff")
         val FLEET_READ = setOf("fleet/hello", "node/get", "session/list", "session/get", "session/messages", "fleet/watch", "fleet/unwatch")
-        val PLUGINS_READ = setOf("plugins/list", "plugins/log", "plugins/grants")
+        val PLUGINS_READ = setOf("plugins/list", "plugins/log", "plugins/grants", "plugins/watch", "plugins/unwatch")
     }
 }

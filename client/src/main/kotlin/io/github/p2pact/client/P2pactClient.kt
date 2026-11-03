@@ -204,6 +204,7 @@ class P2pactClient private constructor(
         when {
             tool == Tools.CHAT_NUMBER && ev == 1 -> c.chat.notified(args)
             tool == Tools.FLEET_NUMBER && ev == 1 -> c.fleet.notified(args)
+            tool == Tools.PLUGINS_NUMBER && ev == 1 -> c.plugins.notified(args)
             tool == Tools.PLUGINS_NUMBER -> {}
             else -> toolEvents.emit(ToolEvent(c, node.peerToolName(addr, tool), tool, ev, args.map { normalize(it) }))
         }
@@ -268,6 +269,7 @@ class Computer internal constructor(internal val owner: P2pactClient, val id: St
         owner.resetEventNumbers(id)
         chat.reconnected()
         fleet.reconnected()
+        plugins.reconnected()
         ready.complete(this)
         owner.computerEvents.emit(ComputerEvent.Online(this))
     }
