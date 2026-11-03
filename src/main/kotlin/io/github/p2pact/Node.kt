@@ -767,7 +767,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     /** info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind]. */
     private fun info(peer: String): List<Any?> {
         val tools = LinkedHashMap<Any?, Any?>()
-        for (k in handlers.keys) if (k.first != 0 && !numbers.containsKey(k.first)) tools[k.first] = 1
+        // tools whose handlers check the caller's level are tools too
+        for (k in handlers.keys + levelHandlers.keys) if (k.first != 0 && !numbers.containsKey(k.first)) tools[k.first] = 1
         return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind, namedTools())
     }
 
