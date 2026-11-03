@@ -175,6 +175,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
     @Volatile var noCompression = false
     /** noLearning: do not train our own dictionaries (spec §5). */
     @Volatile var noLearning = false
+    /** kind is what this device is for ([Kind]), told in pairing and the hello (spec §1). */
+    @Volatile var kind = Kind.UNKNOWN
 
     private val loop = ScheduledThreadPoolExecutor(1, daemon("p2pact-node"))
     private val workers: ExecutorService = Executors.newCachedThreadPool(daemon("p2pact-handler"))
@@ -439,15 +441,34 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         throw e.cause ?: e
     }
 
-    /** pairPayload is [name, boot, hints, signing key, os] in the pairing handshake. */
-    private fun pairPayload(): ByteArray = Cbor.encode(listOf(name, boot, hints().toWire(), id.sign.public, goos()))
+    /**
+     * PairInfo is the pairing handshake payload [name, boot, hints, signing key, os, kind]: the
+     * last is optional and a shorter payload (an older device) leaves it zero; more elements than
+     * we know are ignored.
+     */
+    internal class PairInfo(
+        val name: String, val boot: Long, val hints: Hints, val signKey: ByteArray?, val os: String?, val kind: Int,
+    )
+
+    internal fun parsePair(payload: ByteArray): PairInfo {
+        val a = try { Cbor.decode(payload).asList() } catch (e: Exception) { null } ?: emptyList()
+        return PairInfo(a.getOrNull(0).asString() ?: "", a.getOrNull(1).asLong() ?: 0, Hints.fromWire(a.getOrNull(2)),
+            a.getOrNull(3).asBytes(), a.getOrNull(4).asString(), a.getOrNull(5).asInt() ?: Kind.UNKNOWN)
+    }
+
+    /** pairPayload is our payload; with no kind said the field is left out: an older device gets what it knows. */
+    internal fun pairPayload(): ByteArray {
+        val a = arrayListOf<Any?>(name, boot, hints().toWire(), id.sign.public, goos())
+        if (kind != Kind.UNKNOWN) a.add(kind)
+        return Cbor.encode(a)
+    }
 
     /** befriend adds a device known from the family book without pairing: the pair secret comes from both keys. */
     fun befriend(p: Peer) {
         require(p.key.size == 32 && Crypto.address(p.key) == p.addr) { "key does not match address" }
         val old = trust.get(p.addr)
         if (old != null) {
-            trust.put(old.copy(name = p.name, signKey = p.signKey, os = p.os))
+            trust.put(old.copy(name = p.name, signKey = p.signKey, os = p.os, kind = if (p.kind != Kind.UNKNOWN) p.kind else old.kind))
             return
         }
         trust.put(p.copy(pairSecret = id.shared(p.key, "family-pair")))
@@ -508,6 +529,12 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         }
     }
 
+    /** sendInfoForTest sends our hello again (tests: a changed kind, tools). */
+    internal fun sendInfoForTest(peer: String) = onLoop { sendInfo(peer) }
+
+    /** deliverForTest handles a message as if the device had sent it on stream 0 (tests). */
+    internal fun deliverForTest(peer: String, msg: ByteArray) = onLoop { message(peer, msg, 0) }
+
     /** paths lists live roads to a known device: udp, tcp, relay:<address>. */
     fun paths(peer: String): List<String> = onLoop {
         val ps = peers[peer] ?: return@onLoop emptyList()
@@ -515,11 +542,11 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         ps.eps.values.filter { now - it.lastRecv <= ALIVE_FOR }.map { it.ep.road.name }.distinct()
     }
 
-    /** info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints]. */
+    /** info is the hello (spec §6, 0.2): [name, os, implementation, {tool: version}, [dictionaries], hints, kind]. */
     private fun info(peer: String): List<Any?> {
         val tools = LinkedHashMap<Any?, Any?>()
         for (k in handlers.keys) if (k.first != 0) tools[k.first] = 1
-        return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire())
+        return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind)
     }
 
     private fun hints(): Hints {
@@ -672,24 +699,23 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
             h.done.completeExceptionally(IllegalStateException("device key does not match the invite"))
             return
         }
-        val pp = try { Cbor.decode(payload).asList() } catch (e: Exception) { null } ?: emptyList()
+        val pp = parsePair(payload)
         val msg3 = h.hs.writeMessage(pairPayload())
         val (c1, c2) = h.hs.ciphers ?: return
         hs.remove(local)
         val peer = Crypto.address(inv.key)
-        val wh = Hints.fromWire(pp.getOrNull(2))
+        val wh = pp.hints
         val hints = Hints(
             udp = wh.udp.ifEmpty { inv.hints.udp }, tcp = wh.tcp.ifEmpty { inv.hints.tcp }, relay = wh.relay ?: inv.hints.relay,
         )
-        val p = Peer(peer, inv.key, pp.getOrNull(0).asString() ?: "", inv.secret, hints,
-            signKey = pp.getOrNull(3).asBytes(), os = pp.getOrNull(4).asString())
+        val p = Peer(peer, inv.key, pp.name, inv.secret, hints, signKey = pp.signKey, os = pp.os, kind = pp.kind)
         trust.put(p)
         val s = Session(peer, local, u32(pkt, 5), c1, c2, now)
         sessions[local] = s
         current[peer] = s
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
-        bootOf(ps, pp.getOrNull(1).asLong() ?: 0)
+        bootOf(ps, pp.boot)
         from.road.send(from.addr, cat(byteArrayOf(P_PAIR3.toByte()), be32(s.remote), msg3))
         paired(trust.get(peer) ?: p)
         h.done.complete(trust.get(peer) ?: p)
@@ -708,9 +734,8 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         ownRelay?.let { relay(it).leave(inv.id.hex()) }
         val key = h.hs.rs!!.copyOf()
         val peer = Crypto.address(key)
-        val pp = try { Cbor.decode(payload).asList() } catch (e: Exception) { null } ?: emptyList()
-        val p = Peer(peer, key, pp.getOrNull(0).asString() ?: "", inv.secret, Hints.fromWire(pp.getOrNull(2)),
-            signKey = pp.getOrNull(3).asBytes(), os = pp.getOrNull(4).asString(), via = inv.id.hex())
+        val pp = parsePair(payload)
+        val p = Peer(peer, key, pp.name, inv.secret, pp.hints, signKey = pp.signKey, os = pp.os, kind = pp.kind, via = inv.id.hex())
         trust.put(p)
         // the joiner was the initiator; we are the responder
         val s = Session(peer, local, h.remoteIdx, c2, c1, now)
@@ -718,7 +743,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
         current[peer] = s
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
-        bootOf(ps, pp.getOrNull(1).asLong() ?: 0)
+        bootOf(ps, pp.boot)
         paired(trust.get(peer) ?: p)
     }
 
@@ -803,6 +828,7 @@ class Node(dir: File, val name: String, private val timing: LearnTiming = LearnT
                 val ev = a[2].asInt() ?: return
                 if (tool == 0 && ev == 2 && a.size >= 9) { // hello: name, hints, dictionaries
                     trust.setHints(peer, a[3].asString() ?: "", a[4].asString() ?: "", Hints.fromWire(a[8]))
+                    if (a.size >= 10) a[9].asInt()?.let { trust.setKind(peer, it) }
                     ps.dicts = idsOf(a[7])
                     ps.lacks = ArrayList()
                     ps.tried = ArrayList()

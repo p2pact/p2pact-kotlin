@@ -114,12 +114,21 @@ data class Peer(
     val signKey: ByteArray? = null,
     val os: String? = null,
     val via: String? = null, // joined through our invite with this id (hex)
+    val kind: Int = Kind.UNKNOWN, // what the device is for (spec §1); 0 — not said
 ) {
     /** relayChannel is the pair's relay channel: only these two devices know it (spec §3). */
     val relayChannel: String get() = Crypto.mac(pairSecret, "relay").copyOf(16).hex()
 
     override fun equals(other: Any?) = other is Peer && other.addr == addr && same(other.key, key)
     override fun hashCode() = addr.hashCode()
+}
+
+/** Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello. */
+object Kind {
+    const val UNKNOWN = 0 // not said (an older device): guess as before, e.g. by OS
+    const val COMPUTER = 1 // runs agents, serves tools
+    const val CLIENT = 2 // an app a person holds: a phone, a desktop or web app
+    const val PLUGIN = 3 // a program on the same computer that adds tools to it
 }
 
 /** phone reports a phone OS: a phone is never the family parent. */
@@ -146,7 +155,7 @@ class Trust(dir: File) {
                         addr = m["addr"] as? String ?: continue, key = key, name = m["name"] as? String ?: "",
                         pairSecret = unb64(m["pair_secret"] as? String) ?: ByteArray(0), hints = Hints.fromJson(m["hints"]),
                         added = (m["added"] as? Number)?.toLong() ?: 0, signKey = unb64(m["sign_key"] as? String),
-                        os = m["os"] as? String, via = m["via"] as? String,
+                        os = m["os"] as? String, via = m["via"] as? String, kind = (m["kind"] as? Number)?.toInt() ?: 0,
                     )
                     if (p.key.size == 32 && Crypto.address(p.key) == p.addr) peers[p.addr] = p
                 }
@@ -166,6 +175,15 @@ class Trust(dir: File) {
     @Synchronized
     fun put(p: Peer) {
         peers[p.addr] = if (p.added == 0L) p.copy(added = System.currentTimeMillis()) else p
+        save()
+    }
+
+    /** setKind stores the kind a device told in its hello. */
+    @Synchronized
+    fun setKind(addr: String, kind: Int) {
+        val p = peers[addr] ?: return
+        if (p.kind == kind) return
+        peers[addr] = p.copy(kind = kind)
         save()
     }
 
@@ -198,6 +216,7 @@ class Trust(dir: File) {
                 p.signKey?.let { put("sign_key", b64(it)) }
                 p.os?.let { put("os", it) }
                 p.via?.let { put("via", it) }
+                if (p.kind != Kind.UNKNOWN) put("kind", p.kind)
             }
         }
         val b = Json.write(list, "  ").toByteArray()
