@@ -2,6 +2,8 @@ package io.github.p2pact
 
 import java.io.DataInputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -138,16 +140,18 @@ class UdpRoad internal constructor(bind: String, private val recv: Receiver) : R
     internal fun close() = socket.close()
 }
 
+/** Link is one connection of a stream road: what is read (buffered), what is written, how to close it. */
+internal class Link(val input: InputStream, val output: OutputStream, val close: () -> Unit)
+
 /**
- * TcpRoad is the fallback road where UDP is blocked (spec §3): a 2-byte length, then the
- * packet. Connections are made on demand and reused both ways; sessions do not depend on them.
+ * StreamRoad carries packets over connections that keep order, each framed as a 2-byte length and
+ * the packet (spec §3): TCP (the fallback road where UDP is blocked) and the local socket. Connections
+ * are made on demand and reused both ways; sessions do not depend on them.
  */
-class TcpRoad internal constructor(bind: String, private val recv: Receiver) : Road {
-    override val name = "tcp"
-    private val server: ServerSocket?
+abstract class StreamRoad internal constructor(final override val name: String, private val recv: Receiver) : Road {
     private val conns = ConcurrentHashMap<String, Conn>() // by remote address as we know it
-    private val closed = AtomicBoolean()
-    @Volatile private var paused = false // no connections (the node pauses); the listener stays and refuses them
+    internal val closed = AtomicBoolean()
+    @Volatile internal var paused = false // no connections (the node pauses); the listener stays and refuses them
     private val sentBytes = AtomicLong()
     private val sentPackets = AtomicLong()
     private val recvBytes = AtomicLong()
@@ -155,12 +159,12 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
 
     private inner class Conn(val addr: String) {
         val out = LinkedBlockingQueue<ByteArray>(1024)
-        @Volatile var socket: Socket? = null
+        @Volatile var link: Link? = null
         private val stopped = AtomicBoolean()
 
         fun stop() {
             if (!stopped.compareAndSet(false, true)) return
-            try { socket?.close() } catch (e: IOException) { }
+            try { link?.let { it.close() } } catch (e: IOException) { }
             out.offer(ByteArray(0)) // wakes the writer
             conns.remove(addr, this)
         }
@@ -168,13 +172,12 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
         val isStopped get() = stopped.get()
 
         /** serve runs one connection: a writer thread and this reader. */
-        fun serve(s: Socket) {
-            socket = s
-            if (stopped.get()) { s.close(); return }
-            try { s.tcpNoDelay = true } catch (e: IOException) { }
+        fun serve(l: Link) {
+            link = l
+            if (stopped.get()) { l.close(); return }
             Thread({
                 try {
-                    val os = s.getOutputStream()
+                    val os = l.output
                     while (!stopped.get()) {
                         val f = out.poll(30, TimeUnit.SECONDS) ?: continue
                         if (f.isEmpty()) break
@@ -191,11 +194,10 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
                 } finally {
                     stop()
                 }
-            }, "p2pact-tcp-w").apply { isDaemon = true }.start()
+            }, "p2pact-$name-w").apply { isDaemon = true }.start()
             try {
-                s.soTimeout = 3 * 60_000
-                val inp = DataInputStream(s.getInputStream().buffered(64 shl 10))
-                val ep = Endpoint(this@TcpRoad, addr)
+                val inp = DataInputStream(l.input)
+                val ep = Endpoint(this@StreamRoad, addr)
                 while (!stopped.get()) {
                     val n = inp.readUnsignedShort()
                     if (n > MAX_PACKET + 64) break
@@ -212,33 +214,15 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
         }
     }
 
-    init {
-        server = if (bind.isEmpty()) null else {
-            val (host, port) = hostPort(bind) ?: ("" to (bind.removePrefix(":").toIntOrNull() ?: 0))
-            val ss = ServerSocket()
-            ss.reuseAddress = true
-            ss.bind(if (host.isEmpty()) InetSocketAddress(port) else InetSocketAddress(InetAddress.getByName(host), port))
-            Thread({
-                while (!closed.get()) {
-                    val s = try { ss.accept() } catch (e: IOException) { break }
-                    if (paused) {
-                        try { s.close() } catch (e: IOException) { }
-                        continue
-                    }
-                    val addr = joinHostPort(s.inetAddress, s.port)
-                    val c = Conn(addr)
-                    conns.put(addr, c)?.stop()
-                    Thread({ c.serve(s) }, "p2pact-tcp-r").apply { isDaemon = true }.start()
-                }
-            }, "p2pact-tcp-accept").apply { isDaemon = true }.start()
-            ss
-        }
+    /** connect dials addr: null — it did not answer. It runs on a thread of its own. */
+    internal abstract fun connect(addr: String): Link?
+
+    /** accepted serves a connection a listener took in; addr names it for answers. */
+    internal fun accepted(addr: String, link: Link) {
+        val c = Conn(addr)
+        conns.put(addr, c)?.stop()
+        Thread({ c.serve(link) }, "p2pact-$name-r").apply { isDaemon = true }.start()
     }
-
-    /** localAddr is the listen address ("" — dial only). */
-    val localAddr: String get() = server?.let { joinHostPort(it.inetAddress, it.localPort) } ?: ""
-
-    internal fun localAddrs(): List<String> = server?.let { localAddrs(it.inetAddress, it.localPort) } ?: emptyList()
 
     fun stats() = RoadStats(sentBytes.get(), sentPackets.get(), recvBytes.get(), recvPackets.get())
 
@@ -262,17 +246,9 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
 
     private fun dial(c: Conn) {
         Thread({
-            val (h, p) = hostPort(c.addr) ?: run { c.stop(); return@Thread }
-            val s = Socket()
-            try {
-                s.connect(InetSocketAddress(InetAddress.getByName(h), p), 10_000)
-            } catch (e: IOException) {
-                try { s.close() } catch (x: IOException) { }
-                c.stop()
-                return@Thread
-            }
-            c.serve(s)
-        }, "p2pact-tcp-dial").apply { isDaemon = true }.start()
+            val l = try { connect(c.addr) } catch (e: Exception) { null }
+            if (l == null) c.stop() else c.serve(l)
+        }, "p2pact-$name-dial").apply { isDaemon = true }.start()
     }
 
     /** pause closes every connection and refuses new ones (true), or takes them again. */
@@ -284,9 +260,65 @@ class TcpRoad internal constructor(bind: String, private val recv: Receiver) : R
     /** connections counts open connections (tests). */
     internal val connections: Int get() = conns.size
 
-    internal fun close() {
+    internal open fun close() {
+        closed.set(true)
+        for (c in conns.values) c.stop()
+    }
+}
+
+/**
+ * TcpRoad is the fallback road where UDP is blocked (spec §3): a 2-byte length, then the
+ * packet. Connections are made on demand and reused both ways; sessions do not depend on them.
+ */
+class TcpRoad internal constructor(bind: String, recv: Receiver) : StreamRoad("tcp", recv) {
+    private val server: ServerSocket?
+
+    init {
+        server = if (bind.isEmpty()) null else {
+            val (host, port) = hostPort(bind) ?: ("" to (bind.removePrefix(":").toIntOrNull() ?: 0))
+            val ss = ServerSocket()
+            ss.reuseAddress = true
+            ss.bind(if (host.isEmpty()) InetSocketAddress(port) else InetSocketAddress(InetAddress.getByName(host), port))
+            Thread({
+                while (!closed.get()) {
+                    val s = try { ss.accept() } catch (e: IOException) { break }
+                    if (paused) {
+                        try { s.close() } catch (e: IOException) { }
+                        continue
+                    }
+                    accepted(joinHostPort(s.inetAddress, s.port), link(s))
+                }
+            }, "p2pact-tcp-accept").apply { isDaemon = true }.start()
+            ss
+        }
+    }
+
+    private fun link(s: Socket): Link {
+        try { s.tcpNoDelay = true } catch (e: IOException) { }
+        s.soTimeout = 3 * 60_000
+        return Link(s.getInputStream().buffered(64 shl 10), s.getOutputStream()) { s.close() }
+    }
+
+    override fun connect(addr: String): Link? {
+        val (h, p) = hostPort(addr) ?: return null
+        val s = Socket()
+        try {
+            s.connect(InetSocketAddress(InetAddress.getByName(h), p), 10_000)
+        } catch (e: IOException) {
+            try { s.close() } catch (x: IOException) { }
+            return null
+        }
+        return link(s)
+    }
+
+    /** localAddr is the listen address ("" — dial only). */
+    val localAddr: String get() = server?.let { joinHostPort(it.inetAddress, it.localPort) } ?: ""
+
+    internal fun localAddrs(): List<String> = server?.let { localAddrs(it.inetAddress, it.localPort) } ?: emptyList()
+
+    override fun close() {
         closed.set(true)
         try { server?.close() } catch (e: IOException) { }
-        for (c in conns.values) c.stop()
+        super.close()
     }
 }
