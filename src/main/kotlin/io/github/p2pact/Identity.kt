@@ -149,6 +149,11 @@ data class Peer(
     val granted: List<Grant>? = null,
     /** We reach the device over our local socket (a plugin's host, spec §3). */
     val local: Boolean = false,
+    /**
+     * The devices we forward to for this one (spec §3, [Node.allowForward]); the consent is for
+     * the pair, so each of the two lists the other.
+     */
+    val forward: List<String> = emptyList(),
 ) {
     /** relayChannel is the pair's relay channel: only these two devices know it (spec §3). */
     val relayChannel: String get() = Crypto.mac(pairSecret, "relay").copyOf(16).hex()
@@ -192,6 +197,7 @@ class Trust(dir: File) {
                         os = m["os"] as? String, via = m["via"] as? String, kind = (m["kind"] as? Number)?.toInt() ?: 0,
                         grants = grantsFromJson(m["grants"]), granted = grantsFromJson(m["granted"]),
                         local = m["local"] as? Boolean ?: false,
+                        forward = (m["forward"] as? List<*>)?.mapNotNull { it as? String } ?: emptyList(),
                     )
                     if (p.key.size == 32 && Crypto.address(p.key) == p.addr) peers[p.addr] = p
                 }
@@ -257,8 +263,18 @@ class Trust(dir: File) {
     @Synchronized
     fun remove(addr: String): Boolean {
         if (peers.remove(addr) == null) return false
+        // forgetting a device withdraws forwarding to it
+        for ((k, p) in peers.entries.toList()) if (addr in p.forward) peers[k] = p.copy(forward = p.forward - addr)
         save()
         return true
+    }
+
+    /** setForward stores the devices we forward to for a known device. */
+    @Synchronized
+    fun setForward(addr: String, list: List<String>) {
+        val p = peers[addr] ?: return
+        peers[addr] = p.copy(forward = list.toList())
+        save()
     }
 
     private fun save() {
@@ -273,6 +289,7 @@ class Trust(dir: File) {
                 put("grants", p.grants?.let { grantsToJson(it) }) // null: never set, the default
                 p.granted?.let { put("granted", grantsToJson(it)) }
                 if (p.local) put("local", true)
+                if (p.forward.isNotEmpty()) put("forward", p.forward)
             }
         }
         val b = Json.write(list, "  ").toByteArray()

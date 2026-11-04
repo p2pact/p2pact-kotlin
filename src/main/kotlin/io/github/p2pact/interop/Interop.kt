@@ -22,6 +22,7 @@
 // Kinds, named tools, grants, wants, the local socket and hosted tools: "kind", "peer-info", "tool",
 // "call-tool", "grant", "set-grants", "grants", "emit", "events", "on-wants", "local", "plugin-env", "proxy" and
 // join with "wants" (see p2pact-go/cmd/p2pact-interop for their JSON).
+// Via a third device (spec §3): "hide", "forward", "paths", "forward-stats" (the same JSON as p2pact-go).
 // Errors: {"error":"…"}. Usage: p2pact-interop [data dir] [name]
 package io.github.p2pact.interop
 
@@ -30,6 +31,7 @@ import io.github.p2pact.AppRoadConfig
 import io.github.p2pact.Errors
 import io.github.p2pact.Grant
 import io.github.p2pact.Handler
+import io.github.p2pact.Hints
 import io.github.p2pact.LEVEL_WRITE
 import io.github.p2pact.Invite
 import io.github.p2pact.Json
@@ -233,6 +235,19 @@ fun main(argv: Array<String>) {
                         }
                     }
                     say(mapOf("ok" to true))
+                }
+                "hide" -> {
+                    node.setAdvertise(Hints())
+                    say(mapOf("ok" to true))
+                }
+                "forward" -> {
+                    node.allowForward(req["a"] as String, req["b"] as String, req["on"] == true)
+                    say(mapOf("ok" to true))
+                }
+                "paths" -> say(mapOf("paths" to node.paths(req["peer"] as String)))
+                "forward-stats" -> {
+                    val (fw, dr) = node.forwardStats()
+                    say(mapOf("forwarded" to fw, "dropped" to dr))
                 }
                 "close" -> {
                     node.close()

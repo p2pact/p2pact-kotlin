@@ -91,6 +91,13 @@ phone.callOn(peer.addr, 1, 1, 2, 1, "run the tests")    // stream 1: one per cha
   — learnt from the first handshake on it, and offered to `join` for pairing. The road is used
   while nothing better is up; the session moves to UDP, TCP or a relay as soon as one answers
   and comes back when they fall silent.
+- `allowForward(a, b, on)` — opt this device in as a forwarder between two devices it trusts
+  (spec §3, via a third device): a phone between two computers, or a computer between a phone and
+  another computer. They reach each other through it when nothing else works, end to end
+  encrypted. Kept with the trusted list; `forwardRate` limits each direction (256 KB/s by
+  default). The two devices need nothing: they learn it from the hello and use the road
+  `via:<forwarder>` (`paths`), ranked with an application road. `forwards`, `forwarders` and
+  `forwardStats` tell who forwards for whom and how much.
 
 All protocol state lives on one thread; roads receive on their own threads, training and
 file writes run on threads of their own, so sending never waits for them.

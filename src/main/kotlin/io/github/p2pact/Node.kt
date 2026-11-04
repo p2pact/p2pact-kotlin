@@ -118,6 +118,7 @@ private class PeerState(val addr: String) {
     var tried = ArrayList<ByteArray>() // dictionaries of its list we asked it for and did not get
     val sysCalls = HashSet<Long>() // our calls of tool 0: their results are not conversation
     val inbox = HashMap<Long, Inbox>() // calls and events waiting for their turn, per stream
+    var forwards: List<String> = emptyList() // the devices it forwards to for us, from its hello (spec §3)
 
     /** initGap: retry a handshake after three measured round trips (250 ms – 2 s), else 1 s. */
     fun initGap(): Long = if (st.srtt == 0L) INIT_EVERY else (3 * st.srtt).coerceIn(250 * MS, 2 * SEC)
@@ -197,6 +198,15 @@ class Node(
     @Volatile var kind = Kind.UNKNOWN
     /** closeWaitMs bounds how long close waits for call and event handlers in flight. */
     @Volatile var closeWaitMs = 5000L
+    /** forwardRate: bytes a second we forward in one direction of a pair we forward for ([allowForward]); 0 — [DEFAULT_FORWARD_RATE]. */
+    @Volatile var forwardRate = 0
+
+    private val vias = HashMap<String, ViaRoad>() // roads through forwarders, by forwarder (spec §3)
+    private val fwdBuckets = HashMap<String, FwdBucket>() // rate limit per forwarded direction ("from>to")
+    private val fwdCount = java.util.concurrent.atomic.AtomicLong()
+    private val fwdDropped = java.util.concurrent.atomic.AtomicLong()
+    /** forwardTap sees what we forward (tests). */
+    @Volatile internal var forwardTap: ((from: String, to: String, pkt: ByteArray) -> Unit)? = null
 
     private val loop = ScheduledThreadPoolExecutor(1, daemon("p2pact-node"))
     private val workers: ExecutorService = Executors.newCachedThreadPool(daemon("p2pact-handler"))
@@ -768,7 +778,9 @@ class Node(
         learner.forget(addr)
         peers.remove(addr)?.let { ps -> for (c in ps.calls.values) c.completeExceptionally(IllegalStateException("device forgotten")) }
         current.remove(addr)?.let { sessions.remove(it.local) }
+        val fw = trust.get(addr)?.forward ?: emptyList() // the devices we forwarded to it for: they learn it is withdrawn
         trust.remove(addr)
+        for (a in fw) hello(a)
     }
 
     // --- calls and events ---
@@ -860,7 +872,9 @@ class Node(
         // tools whose handlers check the caller's level are tools too
         for (k in handlers.keys + levelHandlers.keys) if (k.first != 0 && !numbers.containsKey(k.first)) tools[k.first] = 1
         for (t in toolHandlers.keys) if (t != 0 && !numbers.containsKey(t)) tools[t] = 1
-        return listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind, namedTools())
+        val info = listOf(name, goos(), "p2pact-kotlin", tools, dicts.ids(peer), hints().toWire(), kind, namedTools())
+        val fw = forwardsOf(peer).mapNotNull { addrBytes(it) } // whom we forward to for it (spec §3)
+        return if (fw.isEmpty()) info else info + listOf(fw)
     }
 
     private fun hints(): Hints {
@@ -1213,7 +1227,16 @@ class Node(
                     ps.tried = ArrayList()
                     fetchNew(peer, ps)
                     drain(peer, ps)
+                    heardForwards(peer, ps, a.getOrNull(11))
                     onHello?.let { cb -> callbacks.execute { cb(peer) } }
+                    return
+                }
+                if (tool == 0 && ev == EV_FORWARD) { // carry a packet to another device (spec §3)
+                    forward(peer, a.subList(3, a.size))
+                    return
+                }
+                if (tool == 0 && ev == EV_FORWARDED) { // a packet another device sent us through this one
+                    forwarded(peer, a.subList(3, a.size))
                     return
                 }
                 if (tool == 0 && ev == 6 && a.size >= 4) { // what we may use of its tools
@@ -1330,11 +1353,19 @@ class Node(
         tcp?.let { t -> p.hints.tcp.forEach { add(Endpoint(t, it)) } }
         pairRelay(p)?.let { add(Endpoint(it, p.relayChannel)) }
         for (a in apps) if (a.peer == peer) add(a.endpoint) // a road the application opened to this device
+        // devices that forward to it for us (spec §3)
+        for ((x, xs) in peers) if (x != peer && current[x] != null && peer in xs.forwards) add(Endpoint(via(x), peer))
+        // a road via a third device takes retransmissions only while no other road is live: every
+        // packet on it costs the forwarder (spec §7)
+        if (alive.any { it.ep.road !is ViaRoad }) out.removeAll { it.ep.road is ViaRoad }
         return out
     }
 
-    /** roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application provides. */
-    private fun roadRank(r: Road): Int = if (r is AttachedRoad) 3 else when (r.name) { "udp" -> 0; "tcp", "local" -> 1; else -> 2 }
+    /**
+     * roadRank orders kinds of roads (spec §7): UDP, TCP, a relay, then a road the application
+     * provides or a road via a third device.
+     */
+    private fun roadRank(r: Road): Int = if (r is AttachedRoad || r is ViaRoad) 3 else when (r.name) { "udp" -> 0; "tcp", "local" -> 1; else -> 2 }
 
     /** sealTo sends packet content on one endpoint only (a keepalive, a probe). */
     private fun sealTo(s: Session, e: EpState, now: Long, plain: ByteArray) {
@@ -1353,6 +1384,182 @@ class Node(
         if (c.size != 1 || roadRank(c[0].ep.road) < 2) return
         ps.lastProbe = now
         for (e in candidates(peer, ps, now, true)) if (roadRank(e.ep.road) < 2) sealTo(s, e, now, keepalive())
+    }
+
+    // --- via a third device (spec §3, Forward.kt) ---
+
+    /**
+     * ViaRoad is the road to other devices through forwarder x: send wraps a packet into event 0.7
+     * to x; what x hands over (0.8) arrives on it. Its address is the device at the other end.
+     */
+    private inner class ViaRoad(val x: String) : Road {
+        override val name = "via:$x"
+
+        override fun send(addr: String, pkt: ByteArray): Boolean { // on the loop, like every road's send
+            if (pkt.size > MAX_ROAD_PACKET) return false
+            val raw = addrBytes(addr) ?: return false
+            val ps = peers[x] ?: return false
+            if (!direct(ps, Clock.nanos()) || ps.st.queue.size >= FORWARD_QUEUE) return false
+            ps.st.push(Cbor.encode(listOf<Any?>(3, 0, EV_FORWARD, raw, pkt)), false, forwardStream(raw))
+            wake()
+            return true
+        }
+    }
+
+    private fun via(x: String): ViaRoad = vias.getOrPut(x) { ViaRoad(x) }
+
+    /**
+     * direct: we are in session with the device and have a live road to it that is not via a third
+     * device. Forwarding takes one hop only — no chains, no loops.
+     */
+    private fun direct(ps: PeerState, now: Long): Boolean =
+        current[ps.addr] != null && ps.eps.values.any { it.ep.road !is ViaRoad && now - it.lastRecv <= ALIVE_FOR }
+
+    /**
+     * allowForward opts this device in (on) or out as a forwarder between two devices it trusts
+     * (spec §3): one consent for both directions, kept with the trusted list. Both devices learn it
+     * from our hello, sent again to them at once.
+     */
+    fun allowForward(a: String, b: String, on: Boolean): Unit = onLoop {
+        require(a != b && a != id.addr && b != id.addr) { "forwarding needs two other devices" }
+        val pa = trust.get(a) ?: throw IllegalArgumentException("unknown device")
+        val pb = trust.get(b) ?: throw IllegalArgumentException("unknown device")
+        require(pa.kind != Kind.PLUGIN && pb.kind != Kind.PLUGIN) { "a plugin is reachable over the local socket only" }
+        fun set(p: Peer, other: String): Boolean {
+            val list = (p.forward - other).let { if (on) (it + other).sorted() else it }
+            if (list == p.forward) return false
+            trust.setForward(p.addr, list)
+            return true
+        }
+        if (set(pa, b)) hello(a)
+        if (set(pb, a)) hello(b)
+    }
+
+    /** forwards lists the devices we forward to for a known device ([allowForward]). */
+    fun forwards(peer: String): List<String> = onLoop { forwardsOf(peer) }
+
+    private fun forwardsOf(peer: String): List<String> =
+        trust.get(peer)?.forward?.filter { it != peer && trust.get(it) != null } ?: emptyList()
+
+    /** forwarders lists the devices that forward for us to peer: their hellos list it. */
+    fun forwarders(peer: String): List<String> = onLoop {
+        peers.filter { (x, xs) -> x != peer && peer in xs.forwards }.keys.sorted()
+    }
+
+    /** forwardStats: packets this device forwarded for others, and those it dropped. */
+    fun forwardStats(): Pair<Long, Long> = fwdCount.get() to fwdDropped.get()
+
+    /** hello sends our hello again to a device in session (what we forward for it changed). */
+    private fun hello(peer: String) {
+        if (current[peer] == null) return
+        val ps = peerState(peer) ?: return
+        push(ps, Cbor.encode(listOf<Any?>(3, 0, 2) + info(peer)), 0, false)
+    }
+
+    /** heardForwards takes the list a hello gave; a device newly reachable through it gets a handshake at once. */
+    private fun heardForwards(x: String, ps: PeerState, v: Any?) {
+        val old = ps.forwards
+        ps.forwards = (v.asList() ?: emptyList()).mapNotNull { (it as? ByteArray)?.takeIf { b -> b.size == 16 }?.let(::addrText) }
+            .filter { it != x && it != id.addr } // trust is checked on use
+        val now = Clock.nanos()
+        for (a in ps.forwards) {
+            if (a in old || current[a] != null) continue
+            val pa = peerState(a) ?: continue
+            pa.lastInit = 0
+            startInit(now, a, pa, if (pa.st.idle()) null else pa.st.nextPacket(now, false)?.plain)
+        }
+    }
+
+    /** forward: device from asks us to carry a packet to another device (event 0.7); what we may not or cannot forward is dropped silently. */
+    private fun forward(from: String, args: List<Any?>) {
+        val to = args.getOrNull(0) as? ByteArray
+        val pkt = args.getOrNull(1) as? ByteArray
+        if (to == null || pkt == null || to.size != 16 || pkt.size < 5 || pkt.size > MAX_ROAD_PACKET) {
+            fwdDropped.incrementAndGet()
+            return
+        }
+        val now = Clock.nanos()
+        val dest = addrText(to)
+        val pf = trust.get(from)
+        val pd = if (dest == from || dest == id.addr || pf == null || dest !in pf.forward) null else peerState(dest)
+        val ps = peers[from]
+        if (pd == null || ps == null || !direct(ps, now) || !direct(pd, now) || pd.st.queue.size >= FORWARD_QUEUE) {
+            fwdDropped.incrementAndGet()
+            return
+        }
+        val src = addrBytes(from) ?: return
+        val msg = Cbor.encode(listOf<Any?>(3, 0, EV_FORWARDED, src, pkt))
+        if (!fwdOffer("$from>$dest", FwdPending(dest, msg, forwardStream(src), pkt.size), now)) {
+            fwdDropped.incrementAndGet()
+            return
+        }
+        forwardTap?.invoke(from, dest, pkt)
+    }
+
+    private fun fwdRate(): Double = (if (forwardRate > 0) forwardRate else DEFAULT_FORWARD_RATE).toDouble()
+
+    /** fwdOfferForTest offers a packet of size bytes for a known device to the shaper (tests). */
+    internal fun fwdOfferForTest(dir: String, to: String, size: Int, now: Long): Boolean = onLoop {
+        peerState(to)
+        fwdOffer(dir, FwdPending(to, byteArrayOf(1), 1, size), now)
+    }
+
+    /** fwdOffer forwards p now, or queues it behind its direction's rate; false — dropped. */
+    private fun fwdOffer(dir: String, p: FwdPending, now: Long): Boolean {
+        val b = fwdBuckets.getOrPut(dir) { FwdBucket(FORWARD_BURST.toDouble(), now) }
+        b.refill(now, fwdRate())
+        if (b.q.isEmpty() && b.tokens >= p.size) {
+            b.tokens -= p.size
+            fwdSend(p)
+            return true
+        }
+        if (b.queued + p.size > FORWARD_BURST) return false
+        b.q.addLast(p)
+        b.queued += p.size
+        return true
+    }
+
+    /** fwdRelease forwards what waited for its direction's rate (with every pump). */
+    internal fun fwdReleaseForTest(now: Long) = onLoop { fwdRelease(now) }
+
+    private fun fwdRelease(now: Long) {
+        val it = fwdBuckets.entries.iterator()
+        while (it.hasNext()) {
+            val b = it.next().value
+            if (b.q.isEmpty()) {
+                if (now - b.at > 60 * SEC) it.remove() // full again long ago
+                continue
+            }
+            b.refill(now, fwdRate())
+            while (b.q.isNotEmpty() && b.tokens >= b.q.first().size) {
+                val p = b.q.removeFirst()
+                b.queued -= p.size
+                b.tokens -= p.size
+                fwdSend(p)
+            }
+        }
+    }
+
+    private fun fwdSend(p: FwdPending) {
+        val pd = peers[p.to] ?: return
+        pd.st.push(p.msg, false, p.stream)
+        fwdCount.incrementAndGet()
+        wake()
+    }
+
+    /**
+     * forwarded: forwarder x hands over a packet another device sent us through it (event 0.8). It
+     * is handled as arriving on the road via x — only from a device x told us it forwards to, and
+     * only over a road to x that is not via a third device.
+     */
+    private fun forwarded(x: String, args: List<Any?>) {
+        val src = args.getOrNull(0) as? ByteArray ?: return
+        val pkt = args.getOrNull(1) as? ByteArray ?: return
+        if (src.size != 16 || pkt.size < 5 || pkt.size > MAX_ROAD_PACKET) return
+        val from = addrText(src)
+        val xs = peers[x] ?: return
+        if (from == x || from == id.addr || from !in xs.forwards || trust.get(from) == null || !direct(xs, Clock.nanos())) return
+        receive(pkt, Endpoint(via(x), from))
     }
 
     // --- application roads ---
@@ -1457,6 +1664,7 @@ class Node(
     /** pump sends what is queued and what is due for retransmission. */
     private fun pump(now: Long) {
         if (paused) return // nothing goes, and no timer counts a try: delivery resumes where it stopped
+        fwdRelease(now)
         for ((peer, ps) in peers) {
             val s = current[peer]
             if (s == null) {
@@ -1475,7 +1683,8 @@ class Node(
             val c = candidates(peer, ps, now, false)
             if (c.size == 1) {
                 val r = c[0].ep.road
-                ps.st.reliable = if (r is AttachedRoad) r.config.stream else r.name != "udp"
+                // a road via a third device may drop (the forwarder's limits): a window applies, as on UDP
+                ps.st.reliable = if (r is AttachedRoad) r.config.stream else r.name != "udp" && r !is ViaRoad
                 ps.st.link = if (r is AttachedRoad) r.rate else 0.0
             }
             var i = 0
@@ -1583,7 +1792,8 @@ class Node(
      * lists are learnt anew.
      */
     private fun unhold(now: Long) {
-        for ((peer, ps) in peers) {
+        // a copy: a message run here may add a device (a packet through a forwarder, spec §3)
+        for ((peer, ps) in peers.entries.toList()) {
             if (ps.waiting.isEmpty()) continue
             val held = now - ps.waitSince
             when {
@@ -1796,5 +2006,6 @@ internal fun bootstrap(m: ByteArray): Boolean =
 
 private fun outOfOrder(m: ByteArray): Boolean {
     if (m.size < 2) return false
-    return m[1].toInt() == 1 || m[1].toInt() == 2 || (m.size > 3 && m[1].toInt() == 3 && m[2].toInt() == 0 && (m[3].toInt() == 2 || m[3].toInt() == 5))
+    return m[1].toInt() == 1 || m[1].toInt() == 2 || (m.size > 3 && m[1].toInt() == 3 && m[2].toInt() == 0 && (m[3].toInt() == 2 || m[3].toInt() == 5)) ||
+        forwardMsg(m)
 }
