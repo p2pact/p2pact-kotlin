@@ -15,7 +15,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /**
- * The client SDK against the real Nomad Code engine (Go, `agent/cmd/nomadcode`, TestAppE2E): the
+ * The client SDK against the real Nomad Code engine (Go, `agent/engine`, TestAppE2E): the
  * engine runs as a `go test` process on 127.0.0.1 with a random port, nothing of the user's
  * engine is touched. Only with `P2PACT_ENGINE_E2E=<path to nomad-code/agent>` (Go is needed).
  */
@@ -23,7 +23,7 @@ class EngineE2ETest {
     private class Engine(agent: String, decide: String) : AutoCloseable {
         val dir: File = Files.createTempDirectory("app-e2e").toFile()
         val log = File(dir, "engine.log")
-        val proc: Process = ProcessBuilder("go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./cmd/nomadcode")
+        val proc: Process = ProcessBuilder("go", "test", "-count=1", "-v", "-run", "^TestAppE2E$", "./engine")
             .directory(File(agent)).redirectErrorStream(true).redirectOutput(log)
             .also {
                 it.environment()["NOMAD_APP_E2E"] = dir.path
@@ -79,6 +79,12 @@ class EngineE2ETest {
                     val chat = computer.chat
                     assertTrue(chat.initialize().await().loadSession)
                     assertEquals("s1", chat.listSessions().await().sessions.single().id)
+
+                    // typed extension results (v 2)
+                    assertEquals(2, chat.info!!.version)
+                    assertTrue(chat.agents().await().agents.isNotEmpty())
+                    assertTrue(chat.projects().await().dirs.size >= 0)
+                    assertEquals("nope.txt", chat.files("s1", "nope.txt").await().query)
 
                     // history
                     val loaded = chat.loadSession("s1").await()

@@ -24,6 +24,8 @@ class InitializeResult(
     /** The computer speaks the `_p2pact/<name>` extensions. */
     val extensions: Boolean,
     val raw: JsonMap,
+    /** The extension version the computer speaks (`_meta.p2pact.v`); 2 and up: typed, complete results. 0 when absent. */
+    val version: Int = 0,
 ) {
     companion object {
         fun parse(m: JsonMap): InitializeResult {
@@ -32,7 +34,7 @@ class InitializeResult(
             return InitializeResult(
                 m.int("protocolVersion") ?: 1, info?.str("name"), info?.str("title"), info?.str("version"),
                 m.obj("agentCapabilities")?.bool("loadSession") ?: false,
-                meta.objs("agents").map { AgentInfo.parse(it) }, (meta.int("ext") ?: 0) >= 1, m,
+                meta.objs("agents").map { AgentInfo.parse(it) }, (meta.int("ext") ?: 0) >= 1, m, meta.int("v") ?: 0,
             )
         }
     }
@@ -167,13 +169,13 @@ class PromptResult(val stopReason: String?, /** The `mid` was already executed; 
 /** A message of a conversation, as `_p2pact/older` gives it. */
 class ChatMessage(val seq: Long, val role: String, val text: String, val time: String?, val images: List<String>, val raw: JsonMap)
 
-class OlderPage(val sessionId: String, val messages: List<ChatMessage>, val more: Boolean, val raw: JsonMap)
+class OlderPage(val sessionId: String, val messages: List<ChatMessage>, val more: Boolean, val raw: JsonMap, /** The agent run the page belongs to, when the engine says. */ val run: String? = null)
 
 class DiffFile(val path: String, val added: Int, val removed: Int, val status: String?)
 
 class DiffResult(val files: List<DiffFile>, val patch: String, val truncated: Boolean, /** `not_found`, `not_git` or text. */ val error: String?, val raw: JsonMap)
 
-class ImageResult(/** Base64. */ val data: String?, /** `not_found`, `no_file`, `too_big`, `bad_image`. */ val error: String?, val raw: JsonMap)
+class ImageResult(/** Base64. */ val data: String?, /** `not_found`, `no_file`, `too_big`, `bad_image`. */ val error: String?, val raw: JsonMap, val path: String? = null, val mime: String? = null)
 
 /** `_p2pact/request_answered`: another client answered; stop showing the request. */
 class RequestAnswered(val sessionId: String, val toolCallId: String)
@@ -245,3 +247,48 @@ fun interface PermissionHandler {
 fun interface QuestionHandler {
     fun onQuestion(request: QuestionRequest): java.util.concurrent.CompletionStage<Map<String, String>>
 }
+
+// --- typed results of the `_p2pact/*` methods (chat spec §10) ---
+
+/** The answer of `_p2pact/close`, `restart`, `hide`, `history_open`: [ok], or [error] (an `alert` line from an older engine). */
+class ActionResult(val ok: Boolean, val error: String?, /** The old phone-line shape. */ val lines: List<JsonMap>, val raw: JsonMap)
+
+class SlashArg(val value: String, val desc: String?, val raw: JsonMap)
+
+/** A slash command of the agent (`_p2pact/commands`). */
+class SlashCommand(val name: String, val desc: String?, val hint: String?, val args: List<SlashArg>, val raw: JsonMap)
+
+/** `_p2pact/files`: the files of the chat's folder that match [query]. */
+class FilesResult(val files: List<String>, val query: String, val raw: JsonMap)
+
+/** A past conversation of an agent (`_p2pact/history`); [updated] is Unix milliseconds. */
+class HistoryItem(val id: String, val agent: String, val dir: String, val title: String, val updated: Long, val count: Int, val raw: JsonMap)
+
+/** `_p2pact/history`: one page of past conversations; [cursor] is the next offset when there is more. */
+class HistoryPage(
+    val items: List<HistoryItem>,
+    val query: String,
+    val from: Int,
+    val total: Int,
+    val cursor: Int?,
+    /** Some agents could not be read in time. */
+    val partial: Boolean,
+    val raw: JsonMap,
+)
+
+/** `_p2pact/projects`: the folders the computer knows. */
+class ProjectsResult(
+    val dirs: List<String>,
+    /** Project name -> its folders. */
+    val projectDirs: Map<String, List<String>>,
+    /** Folder -> git remote. */
+    val dirRepos: Map<String, String>,
+    val raw: JsonMap,
+)
+
+/** An agent of `_p2pact/agents`. */
+class AgentEntry(val id: String, val name: String, val type: String?, val enabled: Boolean, val models: List<String>, val default: String?, val raw: JsonMap)
+
+class AgentPreset(val id: String, val name: String, val raw: JsonMap)
+
+class AgentsResult(val agents: List<AgentEntry>, val presets: List<AgentPreset>, val raw: JsonMap)

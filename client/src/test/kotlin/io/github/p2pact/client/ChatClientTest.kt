@@ -221,6 +221,117 @@ class ChatClientTest : ClientTestBase() {
         assertNull(image.data)
     }
 
+    /** The fixture's response with the typed fields stripped: only `lines`, as an older engine answers. */
+    private fun legacy(name: String): JsonMap =
+        mapOf("jsonrpc" to "2.0", "result" to mapOf("lines" to Fixtures.read("p2pact.chat", name).obj("result")!!["lines"]))
+
+    private fun legacyAll(vararg methods: String) {
+        for (m in methods) engine.overrides["1:_p2pact/$m"] = { legacy("_p2pact.$m.response") }
+    }
+
+    private fun checkTyped(chat: ChatClient) {
+        assertEquals(2, chat.initialize().await().version)
+        val older = chat.older("s1", 3).await()
+        assertEquals("привет", older.messages.single().text)
+        assertEquals("r1", older.run)
+
+        val cmds = chat.commands("s1").await()
+        assertSent(1, "_p2pact/commands", "p2pact.chat", "_p2pact.commands.request")
+        assertEquals("review", cmds.single().name)
+        assertEquals("<pr>", cmds.single().hint)
+        assertEquals("base branch", cmds.single().args.single().desc)
+
+        val files = chat.files("s1", "fac").await()
+        assertSent(1, "_p2pact/files", "p2pact.chat", "_p2pact.files.request")
+        assertEquals(listOf("agent/pkg/acpchat/facade.go"), files.files)
+        assertEquals("fac", files.query)
+
+        val hist = chat.history("", 0).await()
+        assertSent(1, "_p2pact/history", "p2pact.chat", "_p2pact.history.request")
+        assertEquals("h1", hist.items.single().id)
+        assertEquals("Fix the build", hist.items.single().title)
+        assertEquals(1793700000000L, hist.items.single().updated)
+        assertEquals(12, hist.items.single().count)
+        assertEquals(2, hist.total)
+
+        val projects = chat.projects("/w/proj").await()
+        assertSent(1, "_p2pact/projects", "p2pact.chat", "_p2pact.projects.request")
+        assertEquals(listOf("/w/proj"), projects.dirs)
+        assertEquals(listOf("/w/proj", "/w/proj-api"), projects.projectDirs["proj"])
+        assertEquals("git@example.com:team/proj.git", projects.dirRepos["/w/proj"])
+
+        val agents = chat.agents().await()
+        assertSent(1, "_p2pact/agents", "p2pact.chat", "_p2pact.agents.request")
+        assertEquals("claude", agents.agents.single().id)
+        assertEquals(listOf("opus", "sonnet"), agents.agents.single().models)
+        assertEquals("sonnet", agents.agents.single().default)
+        assertEquals("p1", agents.presets.single().id)
+
+        val diff = chat.diff("s1").await()
+        assertEquals("a.go", diff.files.single().path)
+        assertEquals("diff --git a/a.go b/a.go\n", diff.patch)
+
+        val missing = chat.image("s1", "/w/proj/shot.png").await()
+        assertEquals("not_found", missing.error)
+        assertNull(missing.data)
+        assertEquals("/w/proj/shot.png", missing.path)
+
+        for (r in listOf(chat.closeSession("s1"), chat.restartSession("s1"), chat.hideSession("s1", true), chat.historyOpen("h1"))) {
+            assertTrue(r.await().ok)
+        }
+        assertSent(1, "_p2pact/history_open", "p2pact.chat", "_p2pact.history_open.request")
+        assertSent(1, "_p2pact/hide", "p2pact.chat", "_p2pact.hide.request")
+    }
+
+    @Test
+    fun typedResults() {
+        val chat = connect().chat
+        checkTyped(chat)
+        // an image with its bytes comes with a mime
+        engine.overrides["1:_p2pact/image"] = { Fixtures.read("p2pact.chat", "_p2pact.image.data.response") }
+        val ok = chat.image("s1", "/w/proj/ok.png").await()
+        assertSent(1, "_p2pact/image", "p2pact.chat", "_p2pact.image.data.request")
+        assertEquals("image/png", ok.mime)
+        assertTrue(ok.data!!.startsWith("iVBOR"))
+    }
+
+    @Test
+    fun legacyResults() {
+        val chat = connect().chat
+        legacyAll("older", "commands", "files", "history", "projects", "agents", "diff", "image", "close", "restart", "hide", "history_open")
+        // an older engine does not say `v` and does not know run
+        engine.overrides["1:initialize"] = { Fixtures.read("p2pact.chat", "initialize.response").let { r ->
+            mapOf("jsonrpc" to "2.0", "result" to (r.obj("result")!! + ("_meta" to mapOf("p2pact" to mapOf("ext" to 1)))))
+        } }
+        assertEquals(0, chat.initialize().await().version)
+        val older = chat.older("s1", 3).await()
+        assertEquals("привет", older.messages.single().text)
+        assertEquals("review", chat.commands("s1").await().single().name)
+        assertEquals("<pr>", chat.commands("s1").await().single().hint)
+        assertEquals(listOf("agent/pkg/acpchat/facade.go"), chat.files("s1", "fac").await().files)
+        val hist = chat.history().await()
+        assertEquals("h1", hist.items.single().id)
+        assertEquals(2, hist.total)
+        assertEquals(listOf("/w/proj", "/w/proj-api"), chat.projects().await().projectDirs["proj"])
+        val agents = chat.agents().await()
+        assertEquals("claude", agents.agents.single().id)
+        assertEquals("p1", agents.presets.single().id)
+        assertEquals("a.go", chat.diff("s1").await().files.single().path)
+        val img = chat.image("s1", "/w/proj/shot.png").await()
+        assertEquals("not_found", img.error)
+        assertTrue(chat.closeSession("s1").await().ok)
+        assertTrue(chat.historyOpen("h1").await().ok)
+    }
+
+    @Test
+    fun legacyAlertIsNotOk() {
+        val chat = connect().chat
+        engine.overrides["1:_p2pact/close"] = { mapOf("jsonrpc" to "2.0", "result" to mapOf("lines" to listOf(mapOf("cmd" to "alert", "text" to "boom")))) }
+        val r = chat.closeSession("s1").await()
+        assertFalse(r.ok)
+        assertEquals("boom", r.error)
+    }
+
     @Test
     fun lateReports() {
         val chat = connect().chat

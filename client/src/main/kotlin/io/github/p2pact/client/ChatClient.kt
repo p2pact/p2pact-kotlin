@@ -55,7 +55,7 @@ class ChatClient internal constructor(private val computer: Computer) {
         val params = mapOf(
             "protocolVersion" to 1,
             "clientCapabilities" to emptyMap<String, Any?>(),
-            "_meta" to mapOf("p2pact" to mapOf("ext" to 1)),
+            "_meta" to mapOf("p2pact" to mapOf("ext" to 1, "v" to 2)),
         )
         val f = computer.rpc(Tools.CHAT_NUMBER, "initialize", params).map { InitializeResult.parse(it) }
         initialized = f
@@ -191,28 +191,112 @@ class ChatClient internal constructor(private val computer: Computer) {
     /** hide hides a chat from the list (on) or shows it again. */
     fun hide(sessionId: String, on: Boolean = true) = command("hide", mapOf("sessionId" to sessionId, "on" to on))
 
+    // Typed results (chat spec §10): the engine answers with typed fields next to `lines`; an older engine
+    // with `lines` only is read from the line with the method's `cmd`. A line the engine sends later than
+    // its result (an older engine, or a client without `v: 2`) is not waited for: the typed value is then
+    // empty, and the content comes to [reports].
+
+    /** The whole `result` of `_p2pact/<name>`, after the events queued before it. */
+    private fun ext(name: String, params: JsonMap): CompletableFuture<JsonMap> =
+        settledCall("_p2pact/$name", params, streamOf(params.str("sessionId"))) { it }
+
+    /** The typed result if it has one of [keys]; else the line [cmd] of `lines` (older engine); else the result. */
+    private fun body(r: JsonMap, cmd: String, vararg keys: String): JsonMap =
+        if (keys.any { it in r }) r else r.objs("lines").firstOrNull { it.str("cmd") == cmd } ?: r
+
+    private fun action(name: String, params: JsonMap): CompletableFuture<ActionResult> = ext(name, params).map { r ->
+        val lines = r.objs("lines")
+        val alert = lines.firstOrNull { it.str("cmd") == "alert" }
+        val ok = r.bool("ok") ?: (alert == null)
+        ActionResult(ok, r.str("error") ?: if (ok) null else alert?.str("text") ?: alert?.str("msg"), lines, r)
+    }
+
+    /** closeSession is [close] with a typed result. */
+    fun closeSession(sessionId: String): CompletableFuture<ActionResult> = action("close", mapOf("sessionId" to sessionId))
+
+    /** restartSession is [restart] with a typed result. */
+    fun restartSession(sessionId: String): CompletableFuture<ActionResult> = action("restart", mapOf("sessionId" to sessionId))
+
+    /** hideSession is [hide] with a typed result. */
+    fun hideSession(sessionId: String, on: Boolean = true): CompletableFuture<ActionResult> = action("hide", mapOf("sessionId" to sessionId, "on" to on))
+
+    /** historyOpen is `_p2pact/history_open`: opens a past conversation of an agent as a chat ([historyId] is a [HistoryItem.id]). */
+    fun historyOpen(historyId: String): CompletableFuture<ActionResult> = action("history_open", mapOf("sessionId" to historyId))
+
     /** older is `_p2pact/older`: the page of messages just before `before` (the `seq` of the oldest you have). */
     fun older(sessionId: String, before: Long): CompletableFuture<OlderPage> =
-        command("older", mapOf("sessionId" to sessionId, "before" to before)).map { lines ->
-            val l = lines.firstOrNull { it.str("cmd") == "older" } ?: emptyMap()
+        ext("older", mapOf("sessionId" to sessionId, "before" to before)).map { r ->
+            val l = body(r, "older", "messages")
             OlderPage(sessionId, l.objs("messages").map { m ->
                 ChatMessage(m.long("seq") ?: 0, m.str("role") ?: "", m.str("text") ?: "", m.str("time"), m["images"].asList()?.mapNotNull { it as? String } ?: emptyList(), m)
-            }, l.bool("more") ?: false, l)
+            }, l.bool("more") ?: false, l, l.str("run"))
+        }
+
+    /** commands is `_p2pact/commands`: the slash commands of the chat's agent. */
+    fun commands(sessionId: String): CompletableFuture<List<SlashCommand>> =
+        ext("commands", mapOf("sessionId" to sessionId)).map { r ->
+            val l = body(r, "commands", "commands")
+            (if ("commands" in l) l.objs("commands") else l.objs("list")).map { c ->
+                SlashCommand(c.str("name") ?: "", c.str("desc"), c.str("hint"), c.objs("args").map { SlashArg(it.str("value") ?: "", it.str("desc"), it) }, c)
+            }
+        }
+
+    /** files is `_p2pact/files`: paths in the chat's folder matching [query]. */
+    fun files(sessionId: String, query: String): CompletableFuture<FilesResult> =
+        ext("files", mapOf("sessionId" to sessionId, "query" to query)).map { r ->
+            val l = body(r, "files", "files")
+            val list = (l["files"] ?: l["list"]).asList()?.mapNotNull { it as? String } ?: emptyList()
+            FilesResult(list, l.str("query") ?: query, l)
+        }
+
+    /** history is `_p2pact/history`: past conversations of the agents, [offset] pages by the page's `cursor`. */
+    fun history(query: String = "", offset: Int = 0): CompletableFuture<HistoryPage> =
+        ext("history", mapOf("query" to query, "offset" to offset)).map { r ->
+            val l = body(r, "history", "items")
+            val items = (if ("items" in l) l.objs("items") else l.objs("list")).map {
+                HistoryItem(it.str("id") ?: "", it.str("agent") ?: "", it.str("dir") ?: "", it.str("title") ?: "", it.long("updated") ?: 0, it.int("count") ?: 0, it)
+            }
+            HistoryPage(items, l.str("query") ?: query, l.int("from") ?: offset, l.int("total") ?: items.size, l.int("cursor"), l.bool("partial") ?: false, l)
+        }
+
+    /** projects is `_p2pact/projects`: the folders and projects of the computer; [cwd] narrows to one folder's project. */
+    fun projects(cwd: String? = null): CompletableFuture<ProjectsResult> =
+        ext("projects", if (cwd != null) mapOf("cwd" to cwd) else emptyMap()).map { r ->
+            val l = body(r, "projects", "dirs", "project_dirs", "dir_repos")
+            ProjectsResult(
+                l["dirs"].asList()?.mapNotNull { it as? String } ?: emptyList(),
+                l.obj("project_dirs")?.mapValues { (_, v) -> v.asList()?.mapNotNull { it as? String } ?: emptyList() } ?: emptyMap(),
+                l.obj("dir_repos")?.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }?.toMap() ?: emptyMap(),
+                l,
+            )
+        }
+
+    /** agents is `_p2pact/agents`: the agents the computer can start and the presets. */
+    fun agents(): CompletableFuture<AgentsResult> =
+        ext("agents", emptyMap()).map { r ->
+            val lines = r.objs("lines")
+            fun listOf(cmd: String) = lines.firstOrNull { it.str("cmd") == cmd }?.objs("list") ?: emptyList()
+            val agents = if ("agents" in r) r.objs("agents") else listOf("agents")
+            val presets = if ("presets" in r) r.objs("presets") else listOf("presets")
+            AgentsResult(agents.map { a ->
+                AgentEntry(a.str("id") ?: "", a.str("name") ?: a.str("id") ?: "", a.str("type"), a.bool("enabled") ?: true,
+                    a["models"].asList()?.mapNotNull { it as? String } ?: emptyList(), a.str("default"), a)
+            }, presets.map { AgentPreset(it.str("id") ?: "", it.str("name") ?: "", it) }, r)
         }
 
     /** diff is `_p2pact/diff`: the changes in the chat's folder (git). */
     fun diff(sessionId: String): CompletableFuture<DiffResult> =
-        command("diff", mapOf("sessionId" to sessionId)).map { lines ->
-            val l = lines.firstOrNull { it.str("cmd") == "diff" } ?: emptyMap()
+        ext("diff", mapOf("sessionId" to sessionId)).map { r ->
+            val l = body(r, "diff", "files", "error")
             DiffResult(l.objs("files").map { DiffFile(it.str("path") ?: "", it.int("added") ?: 0, it.int("removed") ?: 0, it.str("status")) },
                 l.str("patch") ?: "", l.bool("truncated") ?: false, l.str("error"), l)
         }
 
     /** image is `_p2pact/image`: the bytes (base64) of an image a message points to. */
     fun image(sessionId: String, path: String): CompletableFuture<ImageResult> =
-        command("image", mapOf("sessionId" to sessionId, "path" to path)).map { lines ->
-            val l = lines.firstOrNull { it.str("cmd") == "image" } ?: emptyMap()
-            ImageResult(l.str("data"), l.str("error"), l)
+        ext("image", mapOf("sessionId" to sessionId, "path" to path)).map { r ->
+            val l = body(r, "image", "data", "error")
+            ImageResult(l.str("data"), l.str("error"), l, l.str("path") ?: path, l.str("mime"))
         }
 
     // --- from the computer ---
