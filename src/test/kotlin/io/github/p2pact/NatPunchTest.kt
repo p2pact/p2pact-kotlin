@@ -48,6 +48,7 @@ class NatPunchTest : NetTestBase() {
     @After
     fun reset() {
         observeEvery = 25 * SEC
+        reflexiveStale = 80 * SEC
         punchGap = 200 * MS
         punchFor = 3 * SEC
         fakes.forEach { it.close() }
@@ -99,6 +100,56 @@ class NatPunchTest : NetTestBase() {
         relay.reply = { _, n -> encodeObserveReply(n, InetAddress.getByName("203.0.113.5"), 4001) }
         eventually("reflexive replaced") { a.reflexiveAddr == "203.0.113.5:4001" }
         assertEquals(listOf(local, "203.0.113.5:4001"), a.announcedHints().udp)
+    }
+
+    /** Advertised hints get the reflexive address too (as in Go and Swift): it is where our socket is reached from outside. */
+    @Test
+    fun reflexiveAddressJoinsAdvertisedHints() {
+        observeEvery = 300 * MS
+        val relay = fake()
+        val a = node("a")
+        a.setAdvertise(Hints(udp = listOf("198.51.100.1:5000")))
+        a.setRelay(RelayHint(relay.addr, ""))
+        eventually("reflexive learnt") { a.reflexiveAddr == "203.0.113.5:4000" }
+        val h = a.announcedHints()
+        assertEquals(listOf("198.51.100.1:5000", "203.0.113.5:4000"), h.udp)
+        assertEquals(relay.addr, h.relay?.addr)
+
+        // advertising no UDP addresses at all (relay only): the reflexive one is still announced
+        a.setAdvertise(Hints())
+        assertEquals(listOf("203.0.113.5:4000"), a.announcedHints().udp)
+    }
+
+    /** A relay that stops answering: its last answer goes stale and the reflexive address leaves the hints. */
+    @Test
+    fun unansweredReflexiveAddressIsDropped() {
+        observeEvery = 300 * MS
+        reflexiveStale = 1500 * MS
+        val relay = fake()
+        val a = node("a")
+        a.setRelay(RelayHint(relay.addr, ""))
+        eventually("reflexive learnt") { a.reflexiveAddr == "203.0.113.5:4000" }
+        relay.reply = { _, _ -> null }
+        eventually("reflexive dropped") { a.reflexiveAddr == null }
+        assertEquals(listOf(a.udpRoad!!.localAddr), a.announcedHints().udp)
+        // the relay answers again: the address comes back
+        relay.reply = { _, n -> encodeObserveReply(n, InetAddress.getByName("203.0.113.5"), 4000) }
+        eventually("reflexive learnt again") { a.reflexiveAddr == "203.0.113.5:4000" }
+    }
+
+    /** Forced observes (relay set, socket changed, resumed) go out at most once a second. */
+    @Test
+    fun forcedObservesAreLimitedToOneASecond() {
+        val relay = fake()
+        val a = node("a")
+        repeat(5) { a.setRelay(RelayHint(relay.addr, "")) }
+        eventually("asked") { relay.requests.isNotEmpty() }
+        Thread.sleep(300)
+        assertEquals(1, relay.requests.size)
+        // the pending forced one goes after the second is up, once
+        eventually("asked again after a second") { relay.requests.size == 2 }
+        Thread.sleep(1500)
+        assertEquals(2, relay.requests.size)
     }
 
     @Test

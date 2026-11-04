@@ -27,6 +27,9 @@ private const val SESSION_IDLE = 180 * SEC
 /** observeEvery: how often we ask the relay what address it sees us at (NAT hole punching); tests shorten it. */
 @Volatile internal var observeEvery = 25 * SEC
 
+/** reflexiveStale: a reflexive address the relay has not confirmed for this long is dropped (3 missed answers and some); tests shorten it. */
+@Volatile internal var reflexiveStale = 80 * SEC
+
 /** punchGap and punchFor: a punch burst sends a keepalive to every UDP address of the device every gap, for this long. */
 @Volatile internal var punchGap = 200 * MS
 @Volatile internal var punchFor = 3 * SEC
@@ -236,6 +239,8 @@ class Node(
     // NAT hole punching: the address the relay sees us at, observe requests in flight, punch bursts running
     private var reflexive: String? = null
     private var lastObserve = 0L
+    private var observeForce = true // ask at the next chance, not in observeEvery
+    private var observeGot = 0L // the relay last answered
     private val observing = HashMap<String, Pair<String, Long>>() // nonce (hex) → relay address as resolved, sent at
     private class Burst(var next: Long, val end: Long)
     private val bursts = HashMap<String, Burst>() // by device
@@ -332,7 +337,7 @@ class Node(
             val old = udp
             udp = u
             reflexive = null // the new socket has another mapping: ask again
-            lastObserve = 0
+            observeForce = true
             observing.clear()
             val now = Clock.nanos()
             for ((peer, ps) in peers) {
@@ -418,7 +423,11 @@ class Node(
     }
 
     /** setRelay sets our relay: used for pairing and pair channels. */
-    fun setRelay(h: RelayHint?) = onLoop { ownRelay = h }
+    fun setRelay(h: RelayHint?) = onLoop {
+        ownRelay = h
+        observeForce = true // ask it where it sees us now
+        observe(Clock.nanos())
+    }
 
     /** setAdvertise announces these hints instead of our own addresses; null — our own again. */
     fun setAdvertise(h: Hints?) = onLoop { advertise = h }
@@ -522,7 +531,7 @@ class Node(
             observing.clear()
             return
         }
-        lastObserve = 0 // ask the relay at once: the mapping may have changed in the sleep
+        observeForce = true // ask the relay at once: the mapping may have changed in the sleep
         val now = Clock.nanos()
         ownRelay?.let { h -> for (k in invites.keys) relay(h).join(k, "a") }
         for (p in trust.list()) {
@@ -910,10 +919,17 @@ class Node(
     }
 
     private fun hints(): Hints {
-        advertise?.let { return if (it.relay == null && ownRelay != null) it.copy(relay = ownRelay) else it }
-        val local = udp?.localAddrs() ?: emptyList()
+        advertise?.let {
+            val h = if (it.relay == null && ownRelay != null) it.copy(relay = ownRelay) else it
+            return h.copy(udp = withReflexive(h.udp))
+        }
+        return Hints(udp = withReflexive(udp?.localAddrs() ?: emptyList()), tcp = tcp?.localAddrs() ?: emptyList(), relay = ownRelay)
+    }
+
+    /** withReflexive adds the address our relay sees us at to UDP addresses, unless it is there (advertised hints too: it is where our socket is reached). */
+    private fun withReflexive(udpAddrs: List<String>): List<String> {
         val refl = reflexive
-        return Hints(udp = if (refl != null && refl !in local) local + refl else local, tcp = tcp?.localAddrs() ?: emptyList(), relay = ownRelay)
+        return if (refl == null || udp == null || ownRelay == null || refl in udpAddrs) udpAddrs else udpAddrs + refl
     }
 
     // --- receiving ---
@@ -1646,11 +1662,19 @@ class Node(
         }
     }
 
-    /** observe asks our relay which address it sees us at, from the UDP socket the UDP road uses; every [observeEvery]. */
+    /**
+     * observe asks our relay which address it sees us at, from the UDP socket the UDP road uses: every [observeEvery],
+     * or at once when [observeForce] is set (relay set, socket changed, resumed) — but not more than once a second.
+     * A reflexive address the relay has not confirmed for [reflexiveStale] is dropped (another network, an old relay).
+     */
     private fun observe(now: Long) {
+        if (paused || closed) return
         val u = udp ?: return
         val h = ownRelay ?: return
-        if (now - lastObserve < observeEvery) return
+        val gap = now - lastObserve
+        if (gap < minOf(SEC, observeEvery) || (!observeForce && gap < observeEvery)) return
+        if (reflexive != null && now - observeGot > reflexiveStale) setReflexive(now, null)
+        observeForce = false
         lastObserve = now
         observing.values.removeIf { now - it.second > 60 * SEC }
         val to = u.resolve(h.addr) ?: return
@@ -1666,11 +1690,17 @@ class Node(
         val (relayAddr, _) = observing[o.nonce.hex()] ?: return
         if (relayAddr != from.addr) return
         observing.remove(o.nonce.hex())
-        val addr = joinHostPort(o.ip, o.port)
+        observeGot = now
+        setReflexive(now, joinHostPort(o.ip, o.port))
+    }
+
+    /** setReflexive records our address as the relay sees it (null — forget it); a change is announced at once, and a new address starts bursts. */
+    private fun setReflexive(now: Long, addr: String?) {
         if (addr == reflexive) return
         reflexive = addr
         hintsAt = 0
         reannounce(now) // the hello carries it
+        if (addr == null) return
         for ((peer, ps) in peers) { // trigger a
             if (current[peer] == null || liveDirect(peer, ps, now)) continue
             startBurst(now, peer)

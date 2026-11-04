@@ -18,6 +18,10 @@
 //     an application road (stream) over a local TCP connection that stands in for a Bluetooth LE
 //     link: writes of at most mtu bytes, paced to rate bytes a second (0 — not paced); the
 //     listening side attaches the first connection it accepts; peer optional (bound road)
+//   {"cmd":"relay","addr":"host:port","fp":"<hex>","ws":["wss://…"]} → {"ok":true}  (our relay; ws ignored here)
+//   {"cmd":"advertise","hints":{"udp":["…"],"tcp":["…"]}}    → {"ok":true}
+//     these addresses instead of our own (the address our relay sees us at still joins the UDP ones);
+//     no "hints" — our own again
 //   {"cmd":"close"}
 // Kinds, named tools, grants, wants, the local socket and hosted tools: "kind", "peer-info", "tool",
 // "call-tool", "grant", "set-grants", "grants", "emit", "events", "on-wants", "local", "plugin-env", "proxy" and
@@ -101,6 +105,17 @@ fun main(argv: Array<String>) {
                     (req["tcp"] as? String)?.let { node.listenTcp(it) }
                     (req["relay"] as? String)?.let { node.setRelay(RelayHint(it, req["fp"] as? String ?: "")) }
                     say(mapOf("addr" to node.id.addr, "udp" to (node.udpRoad?.localAddr ?: ""), "tcp" to (node.tcpRoad?.localAddr ?: "")))
+                }
+                "relay" -> { // the WebSocket URLs ("ws") are for browsers: this library does not announce them
+                    node.setRelay(RelayHint(req["addr"] as? String ?: "", req["fp"] as? String ?: ""))
+                    say(mapOf("ok" to true))
+                }
+                "advertise" -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val h = req["hints"] as? Map<String, Any?>
+                    fun list(k: String) = (h?.get(k) as? List<*>)?.filterIsInstance<String>() ?: emptyList()
+                    node.setAdvertise(if (h == null) null else Hints(udp = list("udp"), tcp = list("tcp")))
+                    say(mapOf("ok" to true))
                 }
                 "invite" -> say(mapOf("invite" to node.invite(600_000).toString()))
                 "join" -> {
