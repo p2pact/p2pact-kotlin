@@ -25,6 +25,14 @@ internal const val ZIP_QUICK_BELOW = 1 shl 10
 /** DICT_KEEP is how many dictionaries of one kind to keep (common, ours for a device, a device's own). */
 internal const val DICT_KEEP = 4
 
+/**
+ * DICT_LISTED_MAX bounds the pair's dictionaries kept because the device still lists them: what a
+ * device may list to another (its common ones, its own for it, the one it got from it). All we
+ * fetch from a device is the pair's here, so its list can hold more than DICT_KEEP of that kind;
+ * evicting one it lists would only make us fetch it again, and again (spec §5).
+ */
+internal const val DICT_LISTED_MAX = 3 * DICT_KEEP
+
 /** SLOTS_MAX: past this many slots, a new dictionary takes the oldest empty one. */
 internal const val SLOTS_MAX = 32
 
@@ -197,6 +205,9 @@ internal class DictStore(dir: File, private val io: java.util.concurrent.Executo
     private var gen = 0 // bumped on every change
     private val cache = HashMap<String, Pair<Int, List<ByteArray>>>()
 
+    /** listedBy reports whether the device a pair's dictionary came from still lists it to us (null — none is): kept past DICT_KEEP, up to DICT_LISTED_MAX. */
+    var listedBy: ((Dict) -> Boolean)? = null
+
     init {
         val order = try { File(this.dir, "order").readText() } catch (e: IOException) { "" }
         val out = ArrayList<Dict>()
@@ -238,9 +249,13 @@ internal class DictStore(dir: File, private val io: java.util.concurrent.Executo
         for (x in dicts) {
             if (same(x.id, d.id) && x.peer == d.peer) continue
             val k = x.peer to x.own
-            val n = (kinds[k] ?: 0) + 1
-            kinds[k] = n
-            if (n > DICT_KEEP) dropped.add(x) else out.add(x)
+            val kept = kinds[k] ?: 0
+            if (kept >= DICT_KEEP && !(kept < DICT_LISTED_MAX && x.peer.isNotEmpty() && !x.own && listedBy?.invoke(x) == true)) {
+                dropped.add(x)
+                continue
+            }
+            kinds[k] = kept + 1
+            out.add(x)
         }
         for (x in dropped) { // one file serves the same bytes kept as another kind
             if (out.none { same(it.id, x.id) }) io.execute { File(dir, x.id.hex()).delete() }

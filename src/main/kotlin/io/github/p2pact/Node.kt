@@ -185,7 +185,7 @@ class Node(
     @Volatile var onGranted: ((peer: String, grants: List<Grant>) -> Unit)? = null
     /** onHello is called when a known device sends its hello. */
     @Volatile var onHello: ((String) -> Unit)? = null
-    /** onHeld is called when messages from a device waited too long for a dictionary or its list and were dropped. */
+    /** onHeld is called when messages from a device waited too long for a dictionary or its list, or were compressed with a dictionary the sender has dropped since, and were dropped. */
     @Volatile var onHeld: ((peer: String, held: Int) -> Unit)? = null
     /** allowDict decides whether a known device may fetch a dictionary (0.5); null — all may. */
     @Volatile var allowDict: ((peer: String, id: ByteArray) -> Boolean)? = null
@@ -234,7 +234,9 @@ class Node(
     private val numbers = HashMap<Int, String>()
     private val versions = HashMap<Int, Int>()
     private val resetAt = HashMap<String, Long>()
-    private val dicts = DictStore(dir, io)
+    private val dicts = DictStore(dir, io).also { s ->
+        s.listedBy = { d -> peers[d.peer]?.let { ps -> hasId(ps.dicts, d.id) } == true } // on the loop, as every change of the store
+    }
     private val learner = Learner(dir, dicts, timing, io, trainer, ::post) { d -> addDictLocal(d) }
     private var woken = false
     private var paused = false // the device sleeps (setPaused): nothing is sent, nothing is taken in
@@ -810,6 +812,12 @@ class Node(
 
     /** deliverForTest handles a message as if the device had sent it on stream 0 (tests). */
     internal fun deliverForTest(peer: String, msg: ByteArray) = onLoop { message(peer, msg, 0) }
+
+    /** addDictForTest stores a dictionary as the node would (a pair's one too) and announces it (tests). */
+    internal fun addDictForTest(d: Dict) = onLoop { addDictLocal(d) }
+
+    /** heldForTest is how many messages from peer wait for a dictionary or its list (tests). */
+    internal fun heldForTest(peer: String): Int = onLoop { peers[peer]?.waiting?.size ?: 0 }
 
     /** paths lists live roads to a known device: udp, tcp, relay:<address>. */
     fun paths(peer: String): List<String> = onLoop {
@@ -1601,10 +1609,11 @@ class Node(
                 Unzip.Missing -> {
                     val did = ps.dicts[(w.msg[0].toInt() and 0xff) - 1]
                     if (did.isNotEmpty()) {
-                        fetchDict(peer, ps, did, true)
+                        if (!hasId(ps.tried, did)) fetchDict(peer, ps, did) // one we could not get: unhold asks again, then drops
                         return
                     }
-                    ps.waiting.removeFirst() // a free slot: the message is damaged
+                    ps.waiting.removeFirst() // a free slot: the sender dropped that dictionary, the message cannot be read
+                    onHeld?.let { cb -> io.execute { cb(peer, 1) } }
                 }
                 Unzip.NoList -> { askInfo(peer, ps); return } // wait for a hello or 0.5, and ask for it
                 Unzip.Bad -> ps.waiting.removeFirst()
@@ -1638,14 +1647,14 @@ class Node(
     /** fetchNew asks the device for the newest dictionary in its list that we lack: so it can compress with it. */
     private fun fetchNew(peer: String, ps: PeerState) {
         val did = ps.dicts.firstOrNull { it.isNotEmpty() && dicts.get(it, peer) == null && !hasId(ps.tried, it) } ?: return
-        fetchDict(peer, ps, did, false)
+        fetchDict(peer, ps, did)
     }
 
     /**
      * fetchDict asks the device for dictionary id (0.5 dict): one it compressed a waiting message
      * with, or a new one in its list. What we get belongs to the pair with it.
      */
-    private fun fetchDict(peer: String, ps: PeerState, did: ByteArray, waiting: Boolean) {
+    private fun fetchDict(peer: String, ps: PeerState, did: ByteArray) {
         if (ps.fetching) return
         ps.fetching = true
         fun attempt(tryN: Int) {
@@ -1662,10 +1671,9 @@ class Node(
                     ps.fetching = false
                     if (closed || peers[peer] !== ps) return@post // forgotten meanwhile
                     if (d != null && !addDictLocal(d)) d = null // could not store it: do not ask again and again
-                    if (d == null) {
-                        if (waiting && ps.waiting.isNotEmpty()) ps.waiting.removeFirst() // unreachable: this message is lost
-                        else ps.tried.add(did)
-                    }
+                    // not dropped at once even if a message waits for it: it stays held, unhold asks
+                    // again after holdAsk and drops it after holdDrop, telling the application (onHeld)
+                    if (d == null) ps.tried.add(did)
                     drain(peer, ps)
                     fetchNew(peer, ps)
                 }
@@ -1679,7 +1687,7 @@ class Node(
      * asks lacks it, so we stop compressing with it for that device (this reply included) until it
      * announces again.
      */
-    private fun dictHandler(peer: String, args: List<Any?>): List<Any?> {
+    internal fun dictHandler(peer: String, args: List<Any?>): List<Any?> {
         val did = args.getOrNull(0).asBytes() ?: throw P2pactError(Errors.BAD_ARGS, "dictionary id required")
         allowDict?.let { if (!it(peer, did)) throw P2pactError(Errors.FORBIDDEN, "dictionary is for the family only") }
         val d = onLoop {

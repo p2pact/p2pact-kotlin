@@ -349,4 +349,75 @@ class NodeTest {
         release.countDown()
         assertEquals("new", fresh.get()[0])
     }
+
+    /**
+     * The sender lists more dictionaries than the receiver keeps of one kind (a common one the
+     * receiver lacks plus four of its own for the receiver: all five are the pair's on the
+     * receiver). The receiver keeps what the sender lists instead of evicting one for another and
+     * fetching it back forever, and messages compressed meanwhile all run.
+     */
+    @Test
+    fun listedDictionariesAreKept() {
+        val a = node("engine")
+        val b = node("cli")
+        val asked = java.util.concurrent.atomic.AtomicInteger()
+        a.handle(0, 5) { peer, args -> asked.incrementAndGet(); a.dictHandler(peer, args) }
+        val got = LinkedBlockingQueue<Any?>()
+        b.onEvent = { _, _, _, args -> got.add(args[0]) }
+        pair(a, b)
+        a.addDict(CommonDict.raw)
+        for (k in 1..DICT_KEEP) a.addDictForTest(Dict(train(CompressTest.chat(k * 100), emptyList(), 4096), b.id.addr, true))
+        val text = "the agent finished the task and pushed a commit; the tests pass and the build is green."
+        for (i in 0 until 20) a.event(b.id.addr, 64, 1, "$i $text")
+        Thread.sleep(2000)
+        assertTrue("b asked for dictionaries ${asked.get()} times: it evicts what a still lists", asked.get() <= 2 * (DICT_KEEP + 1))
+        assertEquals(0, b.heldForTest(a.id.addr))
+        assertEquals(DICT_KEEP + 1, b.dictIds(a.id.addr).count { it.isNotEmpty() })
+        for (i in 0 until 20) assertNotNull("got $i of 20 messages", got.poll(5, TimeUnit.SECONDS))
+    }
+
+    /**
+     * A message waits for a dictionary the sender cannot give: it is not dropped silently at the
+     * first failed fetch, but held, asked for again and dropped after holdDrop with onHeld.
+     */
+    @Test
+    fun heldForUnreachableDictionaryIsReported() {
+        val oldAsk = holdAsk
+        val oldDrop = holdDrop
+        holdAsk = 200 * MS
+        holdDrop = 1500 * MS
+        try {
+            val a = node("a")
+            val dirB = tmp.newFolder()
+            val b = node("b", dir = dirB)
+            a.addDict(CommonDict.raw)
+            b.addDict(CommonDict.raw)
+            pair(a, b)
+            for (i in 0 until 15) echo(a, b, "warm up $i".toByteArray())
+            assertEquals(dictId(CommonDict.raw).hex(), a.dictState(b.id.addr).using?.hex())
+            val asked = java.util.concurrent.atomic.AtomicInteger()
+            a.handle(0, 5) { _, _ -> asked.incrementAndGet(); throw P2pactError(Errors.NOT_FOUND, "no such dictionary") }
+            val port = b.udpRoad!!.localAddr
+            b.close()
+            nodes.remove(b)
+            java.io.File(dirB, "net-dicts").deleteRecursively()
+            val start = System.nanoTime()
+            a.event(b.id.addr, 64, 1, "the agent finished the task and pushed a commit; the tests pass and the build is green.")
+            Thread.sleep(300)
+            val held = LinkedBlockingQueue<Int>()
+            val b2 = Node(dirB, "b")
+            b2.onHeld = { _, k -> held.add(k) }
+            b2.listenUdp(port)
+            b2.start()
+            nodes.add(b2)
+            val k = held.poll(10, TimeUnit.SECONDS)
+            assertNotNull("the held message was dropped silently or never", k)
+            assertTrue(k!! >= 1)
+            assertTrue("dropped too early", System.nanoTime() - start >= holdAsk)
+            assertTrue("asked for the dictionary ${asked.get()} times: not asked again before dropping", asked.get() >= 2)
+        } finally {
+            holdAsk = oldAsk
+            holdDrop = oldDrop
+        }
+    }
 }
