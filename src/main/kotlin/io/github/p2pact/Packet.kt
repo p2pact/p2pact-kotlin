@@ -135,3 +135,47 @@ internal class VarReader(val b: ByteArray, var pos: Int) {
         }
     }
 }
+
+// NAT hole punching: the observe packet (type 8), UDP only, between a device and its relay, never between devices.
+// Request [8][nonce 16][zero padding 19] = 36 bytes; reply [8][nonce 16][ip 16, IPv4 as IPv4-mapped IPv6][port 2, big-endian] = 35 bytes.
+
+internal const val P_OBSERVE = 8
+internal const val OBSERVE_REQUEST = 36
+internal const val OBSERVE_REPLY = 35
+
+internal fun encodeObserve(nonce: ByteArray): ByteArray {
+    require(nonce.size == 16) { "nonce is 16 bytes" }
+    val out = ByteArray(OBSERVE_REQUEST)
+    out[0] = P_OBSERVE.toByte()
+    System.arraycopy(nonce, 0, out, 1, 16)
+    return out
+}
+
+/** Observed is what a relay saw of us: the nonce of our request and our address as it saw it. */
+internal class Observed(val nonce: ByteArray, val ip: java.net.InetAddress, val port: Int)
+
+internal fun encodeObserveReply(nonce: ByteArray, ip: java.net.InetAddress, port: Int): ByteArray {
+    val out = ByteArray(OBSERVE_REPLY)
+    out[0] = P_OBSERVE.toByte()
+    System.arraycopy(nonce, 0, out, 1, 16)
+    val raw = ip.address
+    if (raw.size == 4) {
+        out[27] = 0xff.toByte(); out[28] = 0xff.toByte()
+        System.arraycopy(raw, 0, out, 29, 4)
+    } else {
+        System.arraycopy(raw, 0, out, 17, 16)
+    }
+    out[33] = (port ushr 8).toByte()
+    out[34] = port.toByte()
+    return out
+}
+
+/** decodeObserveReply parses a reply; null — it is not one. */
+internal fun decodeObserveReply(pkt: ByteArray): Observed? {
+    if (pkt.size != OBSERVE_REPLY || pkt[0].toInt() != P_OBSERVE) return null
+    val port = ((pkt[33].toInt() and 0xff) shl 8) or (pkt[34].toInt() and 0xff)
+    if (port == 0) return null
+    val ip = try { java.net.InetAddress.getByAddress(pkt.copyOfRange(17, 33)) } catch (e: java.io.IOException) { return null }
+    if (ip.isAnyLocalAddress) return null
+    return Observed(pkt.copyOfRange(1, 17), ip, port)
+}

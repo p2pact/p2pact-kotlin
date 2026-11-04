@@ -24,6 +24,13 @@ private const val SESSION_IDLE = 180 * SEC
 /** probeEvery: how often the direct roads are tried while a session runs over a relay or an application road (spec §7); tests shorten it. */
 @Volatile internal var probeEvery = 30 * SEC
 
+/** observeEvery: how often we ask the relay what address it sees us at (NAT hole punching); tests shorten it. */
+@Volatile internal var observeEvery = 25 * SEC
+
+/** punchGap and punchFor: a punch burst sends a keepalive to every UDP address of the device every gap, for this long. */
+@Volatile internal var punchGap = 200 * MS
+@Volatile internal var punchFor = 3 * SEC
+
 /** Error codes (spec §6). */
 object Errors {
     const val NO_METHOD = 1
@@ -226,6 +233,25 @@ class Node(
     private var advertise: Hints? = null
     private var hintsSent: ByteArray? = null // our addresses as last announced (reannounce)
     private var hintsAt = 0L
+    // NAT hole punching: the address the relay sees us at, observe requests in flight, punch bursts running
+    private var reflexive: String? = null
+    private var lastObserve = 0L
+    private val observing = HashMap<String, Pair<String, Long>>() // nonce (hex) → relay address as resolved, sent at
+    private class Burst(var next: Long, val end: Long)
+    private val bursts = HashMap<String, Burst>() // by device
+    private val burstCount = AtomicInteger()
+
+    /** punchBursts counts the bursts started (tests). */
+    internal val punchBursts: Int get() = burstCount.get()
+
+    /** forceIndirect makes every session count as not on a direct road (tests: two nodes on loopback are always direct). */
+    @Volatile internal var forceIndirect = false
+
+    /** reflexiveAddr is the address the relay sees us at, null — not learnt (tests). */
+    internal val reflexiveAddr: String? get() = onLoop { reflexive }
+
+    /** announcedHints are the hints we give the devices (tests). */
+    internal fun announcedHints(): Hints = onLoop { hints() }
 
     private val sessions = HashMap<Long, Session>() // by our index
     private val current = HashMap<String, Session>() // the best session with a device
@@ -305,6 +331,9 @@ class Node(
         val old = onLoop {
             val old = udp
             udp = u
+            reflexive = null // the new socket has another mapping: ask again
+            lastObserve = 0
+            observing.clear()
             val now = Clock.nanos()
             for ((peer, ps) in peers) {
                 for ((k, e) in ps.eps.entries.toList()) {
@@ -489,8 +518,11 @@ class Node(
         if (on) {
             for (r in relays.values) r.close()
             for (a in apps) a.drop()
+            bursts.clear()
+            observing.clear()
             return
         }
+        lastObserve = 0 // ask the relay at once: the mapping may have changed in the sleep
         val now = Clock.nanos()
         ownRelay?.let { h -> for (k in invites.keys) relay(h).join(k, "a") }
         for (p in trust.list()) {
@@ -879,7 +911,9 @@ class Node(
 
     private fun hints(): Hints {
         advertise?.let { return if (it.relay == null && ownRelay != null) it.copy(relay = ownRelay) else it }
-        return Hints(udp = udp?.localAddrs() ?: emptyList(), tcp = tcp?.localAddrs() ?: emptyList(), relay = ownRelay)
+        val local = udp?.localAddrs() ?: emptyList()
+        val refl = reflexive
+        return Hints(udp = if (refl != null && refl !in local) local + refl else local, tcp = tcp?.localAddrs() ?: emptyList(), relay = ownRelay)
     }
 
     // --- receiving ---
@@ -896,6 +930,7 @@ class Node(
                 P_PAIR1 -> onPair1(now, pkt, from)
                 P_PAIR2 -> onPair2(now, pkt, from)
                 P_PAIR3 -> onPair3(now, pkt, from)
+                P_OBSERVE -> onObserve(now, pkt, from)
                 P_RESET -> {
                     val idx = u32(pkt, 1)
                     for (s in sessions.values.toList()) {
@@ -971,6 +1006,7 @@ class Node(
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 8))
         from.road.send(from.addr, cat(byteArrayOf(P_RESP.toByte()), be32(s.remote), be32(local), resp))
+        if (from.road is RelayRoad || from.road is AttachedRoad || from.road is ViaRoad) startBurst(now, peer) // trigger c
         // data in the first packet; from a device that has not heard our boot id it may be
         // numbered for our previous boot, to be renumbered once it gets our reply: drop it
         // unacknowledged, it comes again in the session (spec §4.2)
@@ -997,6 +1033,7 @@ class Node(
         ps.heard = true
         seen(ps, from, now, s.local)
         bootOf(ps, u32(payload, 0))
+        if (from.road is RelayRoad || from.road is AttachedRoad || from.road is ViaRoad) startBurst(now, h.peer) // trigger c
         sendInfo(h.peer)
         for ((p, f) in h.early) onData(now, p, f)
     }
@@ -1045,6 +1082,7 @@ class Node(
         current[peer] = s
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
+        if (from.road is RelayRoad || from.road is AttachedRoad || from.road is ViaRoad) startBurst(now, peer) // trigger c
         bootOf(ps, pp.boot)
         from.road.send(from.addr, cat(byteArrayOf(P_PAIR3.toByte()), be32(s.remote), msg3))
         paired(trust.get(peer) ?: p)
@@ -1089,6 +1127,7 @@ class Node(
         current[peer] = s
         val ps = peerState(peer) ?: return
         seen(ps, from, now, s.local)
+        if (from.road is RelayRoad || from.road is AttachedRoad || from.road is ViaRoad) startBurst(now, peer) // trigger c
         bootOf(ps, pp.boot)
         val ask = decide
         if (ask != null) {
@@ -1219,7 +1258,9 @@ class Node(
                 val tool = a[1].asInt() ?: return
                 val ev = a[2].asInt() ?: return
                 if (tool == 0 && ev == 2 && a.size >= 9) { // hello: name, hints, dictionaries
+                    val oldUdp = trust.get(peer)?.hints?.udp ?: emptyList()
                     trust.setHints(peer, a[3].asString() ?: "", a[4].asString() ?: "", Hints.fromWire(a[8]))
+                    if ((trust.get(peer)?.hints?.udp ?: emptyList()) != oldUdp) punchUnlessDirect(peer) // trigger b
                     if (a.size >= 10) a[9].asInt()?.let { trust.setKind(peer, it) }
                     ps.named = if (a.size >= 11) parseNamed(a[10]) else emptyMap()
                     ps.dicts = idsOf(a[7])
@@ -1562,6 +1603,80 @@ class Node(
         receive(pkt, Endpoint(via(x), from))
     }
 
+    // --- NAT hole punching ---
+
+    /** liveDirect: the session with the device runs on a live UDP or TCP road. */
+    private fun liveDirect(peer: String, ps: PeerState, now: Long): Boolean {
+        if (forceIndirect) return false
+        val c = candidates(peer, ps, now, false)
+        return c.size == 1 && now - c[0].lastRecv <= ALIVE_FOR && (c[0].ep.road.name == "udp" || c[0].ep.road.name == "tcp")
+    }
+
+    private fun punchUnlessDirect(peer: String) {
+        if (closed || paused) return
+        val ps = peerState(peer) ?: return
+        val now = Clock.nanos()
+        if (current[peer] == null || liveDirect(peer, ps, now)) return
+        startBurst(now, peer)
+    }
+
+    /** startBurst begins a punch burst to the device: for [punchFor], a keepalive every [punchGap] to each UDP address in its hints. */
+    private fun startBurst(now: Long, peer: String) {
+        if (paused || closed) return
+        burstCount.incrementAndGet()
+        bursts[peer] = Burst(now, now + punchFor)
+    }
+
+    /** burstStep sends the keepalives that are due; a burst ends after [punchFor]. */
+    private fun burstStep(now: Long) {
+        if (bursts.isEmpty()) return
+        for ((peer, b) in bursts.entries.toList()) {
+            if (now >= b.end) { bursts.remove(peer); continue }
+            if (now < b.next) continue
+            b.next = now + punchGap
+            val s = current[peer]
+            val ps = peers[peer]
+            val u = udp
+            val p = trust.get(peer)
+            if (s == null || ps == null || u == null || p == null) { bursts.remove(peer); continue }
+            for (a in p.hints.udp) {
+                val e = ps.eps.getOrPut(Endpoint(u, a).key) { EpState(Endpoint(u, a)) }
+                sealTo(s, e, now, keepalive())
+            }
+        }
+    }
+
+    /** observe asks our relay which address it sees us at, from the UDP socket the UDP road uses; every [observeEvery]. */
+    private fun observe(now: Long) {
+        val u = udp ?: return
+        val h = ownRelay ?: return
+        if (now - lastObserve < observeEvery) return
+        lastObserve = now
+        observing.values.removeIf { now - it.second > 60 * SEC }
+        val to = u.resolve(h.addr) ?: return
+        val nonce = randomBytes(16)
+        observing[nonce.hex()] = to to now
+        u.send(to, encodeObserve(nonce))
+    }
+
+    /** onObserve takes the relay's reply: only for a request of ours and from the address it went to. */
+    private fun onObserve(now: Long, pkt: ByteArray, from: Endpoint) {
+        if (from.road !== udp) return
+        val o = decodeObserveReply(pkt) ?: return
+        val (relayAddr, _) = observing[o.nonce.hex()] ?: return
+        if (relayAddr != from.addr) return
+        observing.remove(o.nonce.hex())
+        val addr = joinHostPort(o.ip, o.port)
+        if (addr == reflexive) return
+        reflexive = addr
+        hintsAt = 0
+        reannounce(now) // the hello carries it
+        for ((peer, ps) in peers) { // trigger a
+            if (current[peer] == null || liveDirect(peer, ps, now)) continue
+            startBurst(now, peer)
+        }
+    }
+
     // --- application roads ---
 
     /**
@@ -1665,6 +1780,7 @@ class Node(
     private fun pump(now: Long) {
         if (paused) return // nothing goes, and no timer counts a try: delivery resumes where it stopped
         fwdRelease(now)
+        burstStep(now)
         for ((peer, ps) in peers) {
             val s = current[peer]
             if (s == null) {
@@ -1715,6 +1831,7 @@ class Node(
             if (s != null) probe(now, p.addr, ps, s)
         }
         unhold(now)
+        observe(now)
         reannounce(now)
         sessions.entries.removeIf { (_, s) -> current[s.peer] !== s && now - s.lastRecv > SESSION_IDLE }
         hs.entries.removeIf { now - it.value.at > 60 * SEC }

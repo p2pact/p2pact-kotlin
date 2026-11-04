@@ -191,6 +191,17 @@ class AppRoadTest {
         }
         assertFalse("a write longer than the MTU", ab.tooBig.get() || ba.tooBig.get())
     }
+    /** A session set up over an application road starts a punch burst (NAT hole punching, trigger c). */
+    @Test
+    fun sessionOverAnApplicationRoadStartsAPunchBurst() {
+        val a = node("Mac", false, learn = false)
+        val b = node("Phone", false, learn = false)
+        bleLink(a, b, false)
+        pair(a, b)
+        echo(b, a, "hello".toByteArray())
+        assertTrue(a.punchBursts + b.punchBursts >= 1)
+    }
+
 
     /** Known devices that have only a Bluetooth link the application names: attaching it starts a session over it. */
     @Test

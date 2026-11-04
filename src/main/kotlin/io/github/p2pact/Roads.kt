@@ -101,6 +101,17 @@ class UdpRoad internal constructor(bind: String, private val recv: Receiver) : R
 
     fun stats() = RoadStats(sentBytes.get(), sentPackets.get(), recvBytes.get(), recvPackets.get())
 
+    /** resolve is addr as the road sees senders from it (an IP literal): "host:port" → "ip:port"; null — unresolvable. */
+    internal fun resolve(addr: String): String? {
+        val a = addrs[addr] ?: run {
+            val (h, p) = hostPort(addr) ?: return null
+            val sa = try { InetSocketAddress(InetAddress.getByName(h), p) } catch (e: IOException) { return null }
+            addrs[addr] = sa
+            sa
+        }
+        return joinHostPort(a.address, a.port)
+    }
+
     override fun send(addr: String, pkt: ByteArray): Boolean {
         sentBytes.addAndGet(pkt.size.toLong())
         sentPackets.incrementAndGet()
