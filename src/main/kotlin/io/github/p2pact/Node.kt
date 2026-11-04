@@ -195,6 +195,8 @@ class Node(
     @Volatile var noLearning = false
     /** kind is what this device is for ([Kind]), told in pairing and the hello (spec §1). */
     @Volatile var kind = Kind.UNKNOWN
+    /** closeWaitMs bounds how long close waits for call and event handlers in flight. */
+    @Volatile var closeWaitMs = 5000L
 
     private val loop = ScheduledThreadPoolExecutor(1, daemon("p2pact-node"))
     private val workers: ExecutorService = Executors.newCachedThreadPool(daemon("p2pact-handler"))
@@ -414,8 +416,34 @@ class Node(
         callbacks.shutdown()
         trainer.shutdownNow()
         io.shutdown()
+        awaitHandlers()
         try { io.awaitTermination(2, TimeUnit.SECONDS) } catch (e: InterruptedException) { }
         trust.flush()
+    }
+
+    /**
+     * awaitHandlers waits for call and event handlers and callbacks in flight, so that none runs
+     * after close returns; what was queued behind them does not run. A handler that is still
+     * running after closeWaitMs is interrupted and not waited for. Close called from a handler
+     * or a callback does not wait for itself.
+     */
+    private fun awaitHandlers() {
+        val me = Thread.currentThread().name
+        if (me == "p2pact-handler" || me == "p2pact-callback") return
+        val deadline = System.nanoTime() + closeWaitMs * 1_000_000
+        try {
+            for (ex in listOf(workers, callbacks)) {
+                val left = deadline - System.nanoTime()
+                if (left <= 0 || !ex.awaitTermination(left, TimeUnit.NANOSECONDS)) {
+                    System.err.println("p2pact: close: a handler still runs after ${closeWaitMs} ms; not waiting for it")
+                    workers.shutdownNow()
+                    callbacks.shutdownNow()
+                    return
+                }
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     /**
