@@ -10,7 +10,11 @@ internal val FIXED_TOOLS = mapOf(
     "p2pact.fleet" to 2,
     "p2pact.family" to 3,
     "p2pact.plugins" to 4,
+    "p2pact.term" to 5,
 )
+
+/** fixedTool is the number the spec gives a tool name (§8): 0-63, the same on every device; null — the name is not one of the spec's. */
+fun fixedTool(name: String): Int? = FIXED_TOOLS[name]
 
 /** FIRST_NAMED_TOOL is the first number a device may choose for a named tool (spec §8). */
 const val FIRST_NAMED_TOOL = 64

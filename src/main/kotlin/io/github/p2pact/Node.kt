@@ -125,6 +125,7 @@ private class PeerState(val addr: String) {
     var askedInfo = 0L
     var fetching = false
     var named: Map<String, ToolRef> = emptyMap() // its named tools, from its hello (spec §8)
+    var fixed: Map<Int, Int>? = null // its tools of the spec, {tool: version} from its hello; null — no hello yet
     var tried = ArrayList<ByteArray>() // dictionaries of its list we asked it for and did not get
     val sysCalls = HashSet<Long>() // our calls of tool 0: their results are not conversation
     val inbox = HashMap<Long, Inbox>() // calls and events waiting for their turn, per stream
@@ -274,6 +275,7 @@ class Node(
     private val readMethods = HashSet<Pair<Int, Int>>()
     private val toolHandlers = HashMap<Int, ToolHandler>() // one handler for all methods of a tool (handleToolAll)
     private val names = HashMap<String, Int>()
+    private val aliases = HashMap<String, String>() // a former name → the tool's name now (aliasTool)
     private val numbers = HashMap<Int, String>()
     private val versions = HashMap<Int, Int>()
     private val resetAt = HashMap<String, Long>()
@@ -571,8 +573,24 @@ class Node(
     /** grantedBy is what a device lets us use of its tools, as it told us (event 0.6); the default if it never did. */
     fun grantedBy(peer: String): List<Grant>? = trust.get(peer)?.offered()
 
-    /** level is the level a device has on one of our tools, by name. */
-    fun level(peer: String, tool: String): Int = trust.get(peer)?.let { grantLevel(it.grants, tool) } ?: 0
+    /** level is the level a device has on one of our tools, by name (counting its aliases, [aliasTool]). */
+    fun level(peer: String, tool: String): Int = trust.get(peer)?.let { levelIn(it.grants, tool) } ?: 0
+
+    /**
+     * levelIn is the level a list of grants gives on a tool, counting its aliases ([aliasTool]):
+     * [grantLevel] for a tool known by more than one name.
+     */
+    fun levelIn(grants: List<Grant>?, tool: String): Int = onLoop { grantLevelOf(grants, tool) }
+
+    /** grantLevelOf is [grantLevel] over a tool's names: the highest level the grants give on any of them. */
+    private fun grantLevelOf(grants: List<Grant>?, name: String): Int =
+        toolNamesOf(name).maxOf { grantLevel(grants, it) }
+
+    /** toolNamesOf is a tool name with its aliases: the tool's name now first, then its former ones. */
+    private fun toolNamesOf(name: String): List<String> {
+        val canonical = aliases[name] ?: name
+        return listOf(canonical) + aliases.filterValues { it == canonical }.keys
+    }
 
     /**
      * setGrants replaces what a trusted device may use (an empty list revokes everything), keeps
@@ -636,21 +654,34 @@ class Node(
      * handleToolAll serves every method of the named tool with h (the tool is registered at version 1
      * if it is not yet). The node only requires read on the tool; what each method needs is for h
      * to check. Methods registered one by one with [handle] keep their own handlers. For a device
-     * that hosts another program's tool (spec §8.2).
+     * that hosts another program's tool (spec §8.2), or one that serves a tool of the spec (a name
+     * of [fixedTool], such as "p2pact.term") itself: it is announced under its fixed number.
      */
     fun handleToolAll(name: String, h: ToolHandler) {
+        val fixed = fixedTool(name)
+        if (fixed != null) {
+            onLoop {
+                toolHandlers[fixed] = h
+                reannounceTools()
+            }
+            return
+        }
         val num = registerTool(name, 1)
         onLoop { toolHandlers[num] = h }
     }
 
     /**
-     * unregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
-     * session) and its handlers are dropped. Registering the name again may give another number.
+     * unregisterTool takes a tool back: it leaves the hello (sent again to the devices in
+     * session) and its handlers are dropped. Registering a name again may give another number.
+     * For a tool of the spec, its handlers are dropped and it leaves the hello.
      */
     fun unregisterTool(name: String) = onLoop {
-        val num = names.remove(name) ?: return@onLoop
-        numbers.remove(num)
-        versions.remove(num)
+        val fixed = fixedTool(name)?.takeIf { it != 0 }
+        val num = fixed ?: names.remove(name) ?: return@onLoop
+        if (fixed == null) {
+            numbers.remove(num)
+            versions.remove(num)
+        }
         toolHandlers.remove(num)
         handlers.keys.removeAll { it.first == num }
         levelHandlers.keys.removeAll { it.first == num }
@@ -686,9 +717,57 @@ class Node(
     fun callTool(peer: String, name: String, method: Int, vararg args: Any?, timeoutMs: Long = 0): CompletableFuture<List<Any?>> =
         callToolOn(peer, 0, name, method, *args, timeoutMs = timeoutMs)
 
+    /**
+     * aliasTool declares [alias] a former name of the tool [canonical] (spec §8.1): a device may
+     * serve one tool under both names, the name of the spec (say "p2pact.term", tool 5) and the one
+     * it had before (say "dev.nomadcode.term", a named tool from 64 up). Grants on either name
+     * count for both: a call or an event of either gets the highest level granted on any of them
+     * ([levelIn]). It is also what [callTool] by canonical falls back to on a device that announces
+     * only the alias. The alias is served as any named tool: register its handlers
+     * ([handleToolAll], [handleTool]) — the same as canonical's — and answer and send events under
+     * the number it was called by.
+     */
+    fun aliasTool(alias: String, canonical: String) {
+        require(validToolName(alias)) { "bad alias: $alias" }
+        require(fixedTool(canonical) != null || validToolName(canonical)) { "bad tool name: $canonical" }
+        onLoop {
+            val c = aliases[canonical] ?: canonical // an alias of an alias names the same tool
+            require(alias != c) { "a tool is not its own alias: $alias" }
+            aliases[alias] = c
+        }
+    }
+
+    /** peerHasTool reports whether a device announced the tool in its last hello: a tool of the spec in its {tool: version}, a named one in its named map. false before its hello. */
+    fun peerHasTool(peer: String, name: String): Boolean = onLoop { peerHasToolOf(peer, name) }
+
+    private fun peerHasToolOf(peer: String, name: String): Boolean {
+        val ps = peers[peer] ?: return false
+        FIXED_TOOLS[name]?.let { return ps.fixed?.containsKey(it) == true }
+        return ps.named.containsKey(name)
+    }
+
+    /** A resolved tool of a device: the [number] to call it by and the [name] it goes under there. */
+    data class ResolvedTool(val number: Int, val name: String)
+
+    /**
+     * resolveTool is the number to call a tool on a device by, and the name it goes under there:
+     * the name itself if the device announced it, else an alias of it ([aliasTool]) the device
+     * announced — a device that knows the tool only by its former name — else, for a tool of the
+     * spec, its fixed number (the device's hello has not come, or it does not list the tool). null
+     * — a named tool the device has not announced under any of its names.
+     */
+    fun resolveTool(peer: String, name: String): ResolvedTool? = onLoop {
+        val names = listOf(name) + toolNamesOf(name).filter { it != name } // asked by an alias: try it first
+        for (nm in names) {
+            if (!peerHasToolOf(peer, nm)) continue
+            return@onLoop ResolvedTool(FIXED_TOOLS[nm] ?: peers[peer]!!.named.getValue(nm).number, nm)
+        }
+        FIXED_TOOLS[name]?.let { ResolvedTool(it, name) }
+    }
+
     /** callToolOn is [callOn] by tool name. */
     fun callToolOn(peer: String, stream: Long, name: String, method: Int, vararg args: Any?, timeoutMs: Long = 0): CompletableFuture<List<Any?>> {
-        val num = toolNumber(peer, name)
+        val num = resolveTool(peer, name)?.number
             ?: return CompletableFuture<List<Any?>>().also {
                 it.completeExceptionally(P2pactError(Errors.NO_METHOD, "the device has no tool $name"))
             }
@@ -867,7 +946,7 @@ class Node(
         onLoop {
             val ps = peerState(peer) ?: throw IllegalArgumentException("unknown device")
             // a tool's events go only to devices with at least read on it (spec §8.1)
-            if (tool != 0 && grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?: "") < LEVEL_READ) return@onLoop
+            if (tool != 0 && grantLevelOf(trust.get(peer)?.grants, toolNameOf(tool) ?: "") < LEVEL_READ) return@onLoop
             push(ps, msg, stream, tool != 0)
         }
     }
@@ -1210,7 +1289,7 @@ class Node(
                 var level = 0
                 var forbidden = false
                 if (tool != 0) { // grants (spec §8.1): tool 0 is always allowed
-                    level = grantLevel(trust.get(peer)?.grants, toolNameOf(tool) ?: "")
+                    level = grantLevelOf(trust.get(peer)?.grants, toolNameOf(tool) ?: "")
                     forbidden = level < requiredLevel(tool, method)
                 }
                 val lh = levelHandlers[tool to method]
@@ -1279,6 +1358,7 @@ class Node(
                     if ((trust.get(peer)?.hints?.udp ?: emptyList()) != oldUdp) punchUnlessDirect(peer) // trigger b
                     if (a.size >= 10) a[9].asInt()?.let { trust.setKind(peer, it) }
                     ps.named = if (a.size >= 11) parseNamed(a[10]) else emptyMap()
+                    ps.fixed = parseFixed(a[6])
                     ps.dicts = idsOf(a[7])
                     ps.lacks = ArrayList()
                     ps.tried = ArrayList()
@@ -1320,6 +1400,13 @@ class Node(
     }
 
     /** parseNamed reads the hello's {name: [tool, version]}; a malformed entry is skipped. */
+    private fun parseFixed(v: Any?): Map<Int, Int> {
+        val m = v as? Map<*, *> ?: return emptyMap()
+        val out = HashMap<Int, Int>()
+        for ((k, e) in m) out[k.asInt() ?: continue] = e.asInt() ?: continue
+        return out
+    }
+
     private fun parseNamed(v: Any?): Map<String, ToolRef> {
         val m = v as? Map<*, *> ?: return emptyMap()
         val out = HashMap<String, ToolRef>()

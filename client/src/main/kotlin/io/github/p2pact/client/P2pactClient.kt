@@ -27,6 +27,14 @@ object Tools {
     const val FLEET = "p2pact.fleet"
     const val PLUGINS = "p2pact.plugins"
 
+    /**
+     * The terminal (tool 5, spec term.md): the SDK has no typed client for it, call it with
+     * [Computer.callTool]; its events arrive on [P2pactClient.toolEvents] named `p2pact.term`. A
+     * computer that serves it under a former name still answers once the alias is declared:
+     * `client.node.aliasTool(former, Tools.TERM)`.
+     */
+    const val TERM = "p2pact.term"
+
     internal const val CHAT_NUMBER = 1
     internal const val FLEET_NUMBER = 2
     internal const val PLUGINS_NUMBER = 4
@@ -251,8 +259,8 @@ class Computer internal constructor(internal val owner: P2pactClient, val id: St
      */
     val grants: List<Grant> get() = node.grantedBy(id) ?: listOf(Grant(ALL_TOOLS, LEVEL_WRITE))
 
-    /** The level we have on a tool of the computer: 0 none, 1 [LEVEL_READ], 2 [LEVEL_WRITE]. */
-    fun level(tool: String): Int = grantLevel(grants, tool)
+    /** The level we have on a tool of the computer: 0 none, 1 [LEVEL_READ], 2 [LEVEL_WRITE]. Grants on a former name of the tool count (`Node.aliasTool`). */
+    fun level(tool: String): Int = node.levelIn(grants, tool)
 
     fun canRead(tool: String) = level(tool) >= LEVEL_READ
     fun canWrite(tool: String) = level(tool) >= LEVEL_WRITE
@@ -304,13 +312,15 @@ class Computer internal constructor(internal val owner: P2pactClient, val id: St
      * callTool calls a method of a tool by name; the number is the computer's own (hosted tools,
      * core spec §8.2). It waits for the computer's hello if it has not come. Arguments are JSON
      * trees (numbers, text, lists, maps, bytes); the result values are the same, bytes as they are.
+     * A tool of the spec the computer does not announce goes by a former name of it the computer
+     * does announce (`Node.aliasTool`): [Tools.TERM] reaches an older computer that named its terminal itself.
      */
     fun callTool(name: String, method: Int, vararg args: Any?, timeoutMs: Long = owner.config.callTimeoutMs): CompletableFuture<List<Any?>> {
         fun go(): CompletableFuture<List<Any?>> {
-            val n = toolNumber(name) ?: return failed(NoMethodException("the computer has no tool $name"))
+            val n = node.resolveTool(id, name)?.number ?: return failed(NoMethodException("the computer has no tool $name"))
             return node.callOn(id, 0, n, method, *args, timeoutMs = timeoutMs).map { it }
         }
-        if (toolNumber(name) != null || hello) return go()
+        if (node.peerHasTool(id, name) || hello) return go()
         // the hello may still be on its way after pairing
         val limit = if (timeoutMs > 0) timeoutMs else 10_000
         return settled(ready, limit).flatMap { go() }

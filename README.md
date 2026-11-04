@@ -120,6 +120,29 @@ computer.chat.prompt("session-id", "run the tests").await()
 Errors are `P2pactException` (`ForbiddenException` is error 4, …) and, for the tool's own
 errors, `RpcException`. See `examples/cli` for a small program.
 
+### Terminals (`p2pact.term`, tool 5)
+
+`p2pact.term` (`Tools.TERM`, spec `term.md`) is a tool of the spec with the fixed number 5. The
+client has no typed layer for it: call it with `computer.callTool(Tools.TERM, method, …)`; its
+events arrive on `client.toolEvents` with `tool == "p2pact.term"`. An application that serves
+terminals itself registers `node.handleToolAll("p2pact.term") { peer, level, method, args -> … }`:
+the hello announces it as tool 5, read lets a device call the methods the handler allows at
+level 1, the handler checks the rest.
+
+A device may have served terminals before under a name of its own (a named tool from 64 up).
+Declare that **former name** (core spec §8.1) on both sides:
+
+```kotlin
+node.aliasTool("dev.example.term", "p2pact.term")
+```
+
+Grants on either name then count for both (the highest level wins, for calls and for events;
+`Node.levelIn`, `Computer.level`). A call to `p2pact.term` goes to number 5 if the device
+announced it in its hello, else to the former name it announced (`Node.resolveTool`,
+`Node.peerHasTool`); a device answers under the number it was called by. `DEFAULT_WANTS` does
+not ask for the terminal: it is a shell of the user, ask for it explicitly
+(`Grant(Tools.TERM, LEVEL_WRITE)`).
+
 ## Status
 
 Identity and keys, invites, known devices (`net-key.json`, `net-peers.json` in p2pact-go's
