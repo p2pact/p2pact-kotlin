@@ -69,6 +69,36 @@ internal fun localAddrs(ip: InetAddress, port: Int): List<String> {
     return out
 }
 
+/**
+ * primeIdle: after this long without a datagram to a public address the NAT may have dropped our mapping, and
+ * the next one primes it again (carrier NATs keep UDP mappings 30 s or more). primeGap: datagrams to public
+ * addresses wait this long behind a prime — a NAT takes a moment to apply it, and a flow that overtakes it gets
+ * a port of its own. primePort is the STUN port (RFC 8489), the port a NAT is primed on; primeHost says the NAT
+ * is on the way to an address. Tests change them.
+ */
+@Volatile internal var primeIdle = 20 * SEC
+@Volatile internal var primeGap = 50 * MS
+
+/** primeLater sends the datagrams that wait behind a prime. */
+private val primeLater by lazy {
+    java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "p2pact-prime").apply { isDaemon = true } }
+}
+@Volatile internal var primePort = 3478
+@Volatile internal var primeHost: (InetAddress) -> Boolean = ::natPublic
+
+/** natPublic: a public IPv4 address, reached through a NAT (not a private, carrier-grade NAT, loopback or link-local one). */
+internal fun natPublic(a: InetAddress): Boolean {
+    val b = when (a) {
+        is Inet4Address -> a.address
+        is Inet6Address -> a.address.takeIf { v -> (0 until 10).all { v[it] == 0.toByte() } && v[10] == 0xff.toByte() && v[11] == 0xff.toByte() }?.copyOfRange(12, 16)
+        else -> null
+    } ?: return false
+    val x = b[0].toInt() and 0xff
+    val y = b[1].toInt() and 0xff
+    return !(x == 0 || x == 10 || x == 127 || x >= 224 || (x == 100 && y and 0xc0 == 64) ||
+        (x == 169 && y == 254) || (x == 172 && y and 0xf0 == 16) || (x == 192 && y == 168))
+}
+
 /** UdpRoad is the main road: one packet is one datagram (spec §3). */
 class UdpRoad internal constructor(bind: String, private val recv: Receiver) : Road {
     override val name = "udp"
@@ -122,12 +152,49 @@ class UdpRoad internal constructor(bind: String, private val recv: Receiver) : R
             addrs[addr] = a
             a
         }
-        return try {
-            socket.send(DatagramPacket(pkt, pkt.size, to))
-            true
-        } catch (e: IOException) {
-            false
+        val wait = prime(to)
+        if (wait > 0) {
+            val cp = pkt.copyOf()
+            primeLater.schedule({ write(cp, to) }, wait, TimeUnit.NANOSECONDS)
+            return true
         }
+        return write(pkt, to)
+    }
+
+    private fun write(pkt: ByteArray, to: InetSocketAddress): Boolean = try {
+        socket.send(DatagramPacket(pkt, pkt.size, to))
+        true
+    } catch (e: IOException) {
+        false
+    }
+
+    // the last datagram to a public IPv4 address and the last prime (see prime), under primeLock
+    private val primeLock = Any()
+    private var publicAt = Long.MIN_VALUE / 2
+    private var primedAt = Long.MIN_VALUE / 2
+
+    /**
+     * prime goes before a datagram to a public IPv4 address when none went to one for [primeIdle] (spec §7):
+     * one byte to port 3478 of the same host. Carrier NATs give a socket one mapping for all destinations
+     * (endpoint-independent, what punching needs) only once it has talked to the STUN port — operators keep
+     * WebRTC working that way; before that, every destination gets its own port, and the address our relay
+     * sees is not the one our devices see. A flow opened before keeps its own port, so the byte goes first and
+     * the datagram waits [primeGap] behind it (the result: how long to wait, ns). Nothing answers it; a
+     * one-byte packet is dropped by every P2PACT receiver.
+     */
+    private fun prime(to: InetSocketAddress): Long {
+        if (!primeHost(to.address)) return 0
+        val now = Clock.nanos()
+        val idle: Boolean
+        val wait: Long
+        synchronized(primeLock) {
+            idle = now - publicAt >= primeIdle
+            publicAt = now
+            if (idle) primedAt = now
+            wait = primedAt + primeGap - now
+        }
+        if (idle) write(byteArrayOf(0), InetSocketAddress(to.address, primePort))
+        return maxOf(wait, 0)
     }
 
     private fun run() {
